@@ -1,0 +1,11 @@
+{
+	"InstallScripts" : 
+	[
+		"/home/aarav/Code/me323/build/cmake_install.cmake",
+		"/home/aarav/Code/me323/build/_deps/libigl-build/cmake_install.cmake",
+		"/home/aarav/Code/me323/build/_deps/glad-build/cmake_install.cmake",
+		"/home/aarav/Code/me323/build/_deps/glfw-build/cmake_install.cmake",
+		"/home/aarav/Code/me323/build/_deps/glfw-build/src/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

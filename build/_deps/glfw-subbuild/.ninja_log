@@ -1,0 +1,21 @@
+# ninja log v7
+0	11	1790863451562461522	glfw-populate-prefix/src/glfw-populate-stamp/glfw-populate-mkdir	d30a33e22c05654c
+0	11	1790863451562461522	/home/aarav/Code/me323/build/_deps/glfw-subbuild/glfw-populate-prefix/src/glfw-populate-stamp/glfw-populate-mkdir	d30a33e22c05654c
+11	7727	1790863459278459587	glfw-populate-prefix/src/glfw-populate-stamp/glfw-populate-download	98b03afff7cf9db3
+11	7727	1790863459278459587	/home/aarav/Code/me323/build/_deps/glfw-subbuild/glfw-populate-prefix/src/glfw-populate-stamp/glfw-populate-download	98b03afff7cf9db3
+7727	7738	1790863459278459587	glfw-populate-prefix/src/glfw-populate-stamp/glfw-populate-update	24087b82dc5b0115
+7727	7738	1790863459278459587	/home/aarav/Code/me323/build/_deps/glfw-subbuild/glfw-populate-prefix/src/glfw-populate-stamp/glfw-populate-update	24087b82dc5b0115
+7738	7748	1790863459298459581	glfw-populate-prefix/src/glfw-populate-stamp/glfw-populate-patch	f5029313fdac1c93
+7738	7748	1790863459298459581	/home/aarav/Code/me323/build/_deps/glfw-subbuild/glfw-populate-prefix/src/glfw-populate-stamp/glfw-populate-patch	f5029313fdac1c93
+7748	7762	1790863459310459578	glfw-populate-prefix/src/glfw-populate-stamp/glfw-populate-configure	f7b553d1874d09fd
+7748	7762	1790863459310459578	/home/aarav/Code/me323/build/_deps/glfw-subbuild/glfw-populate-prefix/src/glfw-populate-stamp/glfw-populate-configure	f7b553d1874d09fd
+7762	7772	1790863459322459575	glfw-populate-prefix/src/glfw-populate-stamp/glfw-populate-build	4dbb1d72efe01657
+7762	7772	1790863459322459575	/home/aarav/Code/me323/build/_deps/glfw-subbuild/glfw-populate-prefix/src/glfw-populate-stamp/glfw-populate-build	4dbb1d72efe01657
+7773	7783	1790863459334459571	glfw-populate-prefix/src/glfw-populate-stamp/glfw-populate-install	39621a3909ede29f
+7773	7783	1790863459334459571	/home/aarav/Code/me323/build/_deps/glfw-subbuild/glfw-populate-prefix/src/glfw-populate-stamp/glfw-populate-install	39621a3909ede29f
+7783	7792	1790863459342459569	glfw-populate-prefix/src/glfw-populate-stamp/glfw-populate-test	d47b2d204a356e48
+7783	7792	1790863459342459569	/home/aarav/Code/me323/build/_deps/glfw-subbuild/glfw-populate-prefix/src/glfw-populate-stamp/glfw-populate-test	d47b2d204a356e48
+7792	7806	1790863459358459564	CMakeFiles/glfw-populate-complete	c807f7d36e7a8352
+7792	7806	1790863459358459564	glfw-populate-prefix/src/glfw-populate-stamp/glfw-populate-done	c807f7d36e7a8352
+7792	7806	1790863459358459564	/home/aarav/Code/me323/build/_deps/glfw-subbuild/CMakeFiles/glfw-populate-complete	c807f7d36e7a8352
+7792	7806	1790863459358459564	/home/aarav/Code/me323/build/_deps/glfw-subbuild/glfw-populate-prefix/src/glfw-populate-stamp/glfw-populate-done	c807f7d36e7a8352

@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"/home/aarav/Code/me323/build/_deps/glfw-subbuild/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

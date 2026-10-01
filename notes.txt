@@ -1,0 +1,20 @@
+First we need a head CAD (https://grabcad.com/library/solid-male-human-head-filled-inside-1)
+then convert stp to stl, using a process called tesselation
+
+Then we need a helmet (https://grabcad.com/library/dr-bike-helmet)... 
+
+The idea is the put the helmet on top of the head, with some space in between the head and the helmet, ie some tunable offset.
+
+Then comes the lattice generation algorithm, 
+The algorithm will be different (probably completely different, based on the metamaterial, for example, some metamaterials already have a analytically defined function in xyz... so thats easy... but others are not so easy... )
+
+Implicit/TPMS Lattices (e.g., Gyroid, Schwarz): Defined mathematically via $f(x,y,z) = 0$, making them extremely easy to evaluate voxel-by-voxel or point-by-point in C++ without complex mesh-boolean operations.Beam/Strut Lattices: Requiring explicit node-and-edge connectivity graphs that get swept into cylinders and unioned.
+
+
+The point of having metamaterials is that we get some fancy material properties. 
+
+Then, once the LGA is done, we can do some final post processing, get the final stl to print...
+
+
+From there the classic 3d printing method takes place... 
+
