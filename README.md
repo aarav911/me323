@@ -504,6 +504,39 @@ and exposes additional X/Y/Z offsets for manual adjustment.
 This is an initial registration method, not the final
 geometric-registration algorithm.
 
+## 6. Stretch fit (optional)
+
+One scale for all three axes cannot match a stock helmet to a particular
+head: with the Run_2 scan the top gets no room for lattice at Gap 5 mm while
+the low sides get 17 mm, and evening that out by raising Gap makes the helmet
+278 × 301 mm. The stretch fit (`src/helmet_fit.cpp`, `src/fit_config.cpp`)
+stretches the helmet along its own three axes, tilts it about the
+side-to-side axis (+ = front up), and places its box centre at the head's
+box centre plus an offset. The values are chosen by
+`analysis_tools/stretch_fit_study.py` (outside this repo; it searches for the
+most even room for lattice within agreed limits) and handed over in
+`fit_config.txt`:
+
+``` text
+ME323_FIT_CONFIG 2
+fit_mode stretch
+head_scale 1
+helmet_scale 1
+gap 0.005
+head_translation 0 0 0
+helmet_translation 0 0 0
+helmet_stretch <sx> <sy> <sz>
+helmet_pitch <degrees>
+helmet_offset <x> <y> <z>
+```
+
+Version 2 is only written in stretch mode; zoom mode still writes version 1,
+byte for byte as before, so older builds keep reading it (and refuse version 2
+rather than misreading it). `--fit zoom|stretch` overrides the file's mode, and
+the viewer has a Zoom / Stretch switch with the stretch values editable.
+`--lattice-room <size>` (model units, 0.02 = 20 mm) adds a target to the
+"Room for lattice" line the generator prints for every fit.
+
 ------------------------------------------------------------------------
 
 # Why Alignment Is Its Own Problem
@@ -614,6 +647,17 @@ The bottom stays open, so the helmet can be put on:
     the whole head, lid included, which sealed the helmet shut.
 -   **The liner is cut by direction only:** it exists where the helmet covers
     the head, vents included, however close the shell comes.
+-   **The shell is the stock wall** (`--shell wall`, the default): the inside of
+    the helmet mesh, found by winding number, plus a thin skin of
+    `--shell-skin` grid cells (default 0.5) on every face so walls thinner than
+    the grid can resolve do not open up. The lattice reaches the wall's inner
+    face and fuses with the skin. The generator checks that the inside it finds
+    adds up to the mesh's own volume and stops if not (a mesh that is not a
+    closed solid): then use `--shell band`, the original, which pads every face
+    by half a skin thickness. Band roughly doubles the wall's material and
+    leaves hollows where the wall is thicker than the band; for the Run_2 stretch
+    fit, Wall cuts the shell from 1116 to 890 cm³ and removes 54 cm³ of sealed
+    pockets.
 -   **It has to slide on.** `src/donning.cpp` tries straight lift-off
     directions (tilts up to 45 degrees forward/back, 10 sideways) and picks
     the one the head blocks least. Liner and lattice are then built against
@@ -644,12 +688,22 @@ the solid material into helmet skin, head-side liner, lattice inside the
 helmet, and material outside the helmet. Step 1 fails if more than 0.1% is
 outside the helmet. Step 2 fails if more than 0.1% is liner or lattice where
 the head was not scanned, liner where the helmet does not cover, or material
-the head passes through for the best straight lift-off direction:
+the head passes through for the best straight lift-off direction. It also
+checks the shell (step 3b): rays aimed at the head from outside must meet the
+output near the stock outer face (no holes), and the middle of the stock wall
+must be solid; and it estimates the mass (`--density`, default 1.0 g/cm³).
+`--shell` / `--shell-skin` must match the generator's:
 
 ``` bash
 ./build/me323 --lattice auxetic --generate-only --export-fit
 python tools/check_output.py final_helmet_auxetic.stl fitted_head.stl fitted_helmet.stl --png slices.png
 ```
+
+`--step3 --zone-helmet data/helmet.STL` adds the step-3 report: room for
+lattice measured along the head's normal over a fixed protection zone (what
+the default Gap-5 zoom fit covers), and a gate (room ≥ 20 mm, p95/p5 ≤ 1.5,
+size ≤ 245 × 280 mm, zone covered ≥ 99%, front edge not lower, shell not in the
+way). The gate counts in the exit status.
 
 This is a first printable-mesh prototype, not a validated helmet design.
 The union is voxel-resampled, so surfaces and thin features are approximate;

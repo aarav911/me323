@@ -234,12 +234,223 @@ def describe(tilt, side):
     return "up, tilted " + " and ".join(parts)
 
 
+def generator_reservation(Vh, Vm, shell="wall", skin_cells=0.5):
+    """lattice_generator.cpp's grid spacing for this head and helmet, and what it
+    reserves between the head and the lattice: clearance (1 voxel) + liner
+    (max(2 voxels, 0.5% of head height)) + the shell's inward part (band: half
+    the skin, max(2.25 voxels, 1%)/2; wall: the skin, skin_cells voxels).
+    The grid coarsens as the helmet grows (4M-sample cap), so this is per fit."""
+    H = np.ptp(Vh[:, 1])
+    cmin, cmax = np.minimum(Vh.min(0), Vm.min(0)), np.maximum(Vh.max(0), Vm.max(0))
+    v = H / 120.0
+
+    def count(v):
+        pad = 8.0 * v
+        return np.prod(np.ceil((cmax - cmin + 2 * pad) / v) + 1)
+
+    while count(v) > 4_000_000:
+        v *= np.cbrt(count(v) / 4_000_000) * 1.01
+    inward = max(2.25 * v, 0.01 * H) / 2 if shell == "band" else skin_cells * v
+    return v, v + max(2.0 * v, 0.005 * H) + inward
+
+
+def zoom_fit(stock_vertices, Vh, gap=0.005):
+    """main.cpp's original zoom fit of the stock helmet (head unscaled, unmoved)."""
+    hmin, hmax = Vh.min(0), Vh.max(0)
+    mmin, mmax = stock_vertices.min(0), stock_vertices.max(0)
+    mc, hc = (mmin + mmax) / 2, (hmin + hmax) / 2
+    s = (hmax[1] - hmin[1] + 2 * gap) / (mmax[1] - mmin[1])
+    V = (stock_vertices - mc) * s
+    V[:, 0] += hc[0]
+    V[:, 2] += hc[2]
+    V[:, 1] += hmax[1] + gap - (mmax[1] - mc[1]) * s
+    return V
+
+
+def front_edge(covered, el, az):
+    """Lowest covered elevation per azimuth column over the front (azimuth 60..120 deg)."""
+    out = np.full(covered.shape[1], np.nan)
+    for j in np.where((az[0] >= 60) & (az[0] < 120))[0]:
+        rows = np.where(covered[:, j])[0]
+        if len(rows):
+            out[j] = el[rows.max(), j]
+    return out
+
+
+def step3(T, lid, centre, helm, S_helm, R, U, step, args, in_way_skin):
+    """Room for lattice along the head's outward normal, over a protection zone,
+    and the step-3 decision gate (agreed 2026-10-15, see DECISIONS.md)."""
+    Vh = T.reshape(-1, 3)
+    Vm = np.asarray(helm.vertices)
+    voxel, reserved = generator_reservation(Vh, Vm, args.shell, args.shell_skin)
+    nt, nph, _, TT, D = direction_map(0.5)
+    w = np.sin(TT)
+    el = 90 - np.degrees(TT)
+    az = (np.degrees(np.arctan2(D[:, 2], D[:, 0])).reshape(nt, nph) + 360) % 360
+    S_head = scene(soup_mesh(T))
+    rh = first_hits(S_head, centre, D)["t_hit"].numpy().reshape(nt, nph).astype(float)
+    if args.zone_helmet:
+        stock = o3d.io.read_triangle_mesh(args.zone_helmet)
+        Rz, _ = cavity_map(scene(o3d.geometry.TriangleMesh(
+            o3d.utility.Vector3dVector(zoom_fit(np.asarray(stock.vertices), Vh)), stock.triangles)), centre)
+        zone = np.isfinite(Rz) & ~U
+        edge0 = front_edge(np.isfinite(Rz), el, az)
+    else:
+        zone = np.isfinite(R) & ~U
+        edge0 = None
+    covered = np.isfinite(R)
+
+    # samples on the scanned head surface, area-uniform (seed differs from the study's)
+    Ts = T[~lid] if lid is not None else T
+    A = 0.5 * np.linalg.norm(np.cross(Ts[:, 1] - Ts[:, 0], Ts[:, 2] - Ts[:, 0]), axis=1)
+    rng = np.random.default_rng(7)
+    n = 40000
+    k = rng.choice(len(Ts), n, p=A / A.sum())
+    a, b = rng.random(n), rng.random(n)
+    f = a + b > 1
+    a[f], b[f] = 1 - a[f], 1 - b[f]
+    tri = Ts[k]
+    P = tri[:, 0] + a[:, None] * (tri[:, 1] - tri[:, 0]) + b[:, None] * (tri[:, 2] - tri[:, 0])
+    N = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
+    N /= np.linalg.norm(N, axis=1)[:, None]
+    if (np.einsum("ij,ij->i", N, P - centre) > 0).mean() < 0.5:
+        N = -N
+    u = (P - centre) / np.linalg.norm(P - centre, axis=1)[:, None]
+    ci = np.clip((np.arccos(np.clip(u[:, 1], -1, 1)) / step).astype(int), 0, nt - 1)
+    cj = (np.mod(np.arctan2(u[:, 2], u[:, 0]), 2 * np.pi) / step).astype(int) % nph
+    in_zone = zone[ci, cj]
+
+    # which way the shell's inner face is wound, from the first hits seen from the centre
+    Tm = Vm[np.asarray(helm.triangles)]
+    Nm = np.cross(Tm[:, 1] - Tm[:, 0], Tm[:, 2] - Tm[:, 0])
+    hit = first_hits(S_helm, centre, D)
+    ok = np.isfinite(hit["t_hit"].numpy())
+    facing = np.einsum("ij,ij->i", Nm[hit["primitive_ids"].numpy()[ok]], D[ok]) > 0
+    shape = max(facing.mean(), 1 - facing.mean())
+    inner_sign = 1.0 if facing.mean() >= 0.5 else -1.0
+
+    h = S_helm.cast_rays(tensor(np.hstack([P + 1e-5 * N, N])))
+    tn, pn = h["t_hit"].numpy().astype(float), h["primitive_ids"].numpy()
+    valid = np.isfinite(tn)
+    valid[valid] &= np.sign(np.einsum("ij,ij->i", Nm[pn[valid]], N[valid])) == inner_sign
+    central = R - rh - reserved
+    room = np.where(valid, tn - reserved, central[ci, cj])[in_zone]
+    uncovered = np.isnan(room).mean()
+    room = room[np.isfinite(room)]
+    cover = (w * (zone & covered)).sum() / (w * zone).sum()
+    edge = front_edge(covered, el, az)
+    front = np.nan
+    if edge0 is not None:
+        both = np.isfinite(edge) & np.isfinite(edge0)
+        front = (edge[both] - edge0[both]).min() if both.any() else np.nan
+    ext = np.ptp(Vm, 0)
+    q = {x: np.percentile(room, x) for x in (5, 50, 95)}
+    mm = 1000.0 if np.ptp(Vh[:, 1]) < 2.0 else 1.0
+    unit = "mm" if mm == 1000.0 else "units"
+    elz = el[ci, cj][in_zone][np.isfinite(np.where(valid, tn, central[ci, cj])[in_zone])]
+    regions = [np.median(room[sel]) * mm if sel.any() else np.nan
+               for sel in (elz > 50, (elz > 20) & (elz <= 50), elz <= 20)]
+
+    print(f"step 3 (room for lattice; {'protection zone from --zone-helmet' if args.zone_helmet else 'zone = what this helmet covers'}):")
+    print(f"   generator grid {voxel*mm:.2f} {unit}, reserved for air + liner + half skin {reserved*mm:.2f} {unit}; "
+          f"measured along the head's normal ({100*valid[in_zone].mean():.0f}% of points; the rest along the ray from the centre); "
+          f"shell mode {args.shell}")
+    print(f"   room: min {room.min()*mm:.2f}, p5 {q[5]*mm:.2f}, median {q[50]*mm:.2f}, p95 {q[95]*mm:.2f}, max {room.max()*mm:.2f} {unit}; "
+          f"top / middle / low medians {regions[0]:.1f} / {regions[1]:.1f} / {regions[2]:.1f}")
+    print(f"   helmet {ext[0]*mm:.1f} x {ext[2]*mm:.1f} {unit} (W x L); zone covered {100*cover:.2f}% "
+          f"({100*uncovered:.2f}% of zone points uncovered); front edge vs today "
+          + (f"{front:+.1f} deg" if np.isfinite(front) else "n/a"))
+    checks = {
+        f"room >= {args.room_target*mm:g} {unit} everywhere in the zone": room.min() >= args.room_target,
+        "p95/p5 room <= 1.5": q[5] > 0 and q[95] / q[5] <= 1.5,
+        f"size <= {args.max_size[0]*mm:g} x {args.max_size[1]*mm:g} {unit}": ext[0] <= args.max_size[0] and ext[2] <= args.max_size[1],
+        "zone covered >= 99%": cover >= 0.99 and uncovered <= 0.01,
+        "front edge not lower than today": not np.isfinite(front) or front >= -0.5,
+        "shape: inner face first >= 99%": shape >= 0.99,
+        "shell not in the way (best lift-off)": not in_way_skin,
+    }
+    for name, ok in checks.items():
+        print(f"   {'PASS' if ok else 'FAIL'}  {name}")
+    verdict = "PASS" if all(checks.values()) else "FAIL"
+    failed = [name for name, ok in checks.items() if not ok]
+    note = ""
+    if failed == ["zone covered >= 99%"] and cover >= 0.985:
+        note = (f" -- borderline: only coverage misses, by {100*(0.99-cover):.2f} points"
+                " (the gate is ours; DECISIONS.md 2026-10-16 accepts such a fit)")
+    print(f"step 3 gate: {verdict}{note}")
+    return verdict
+
+
+def shell_checks(S_out, S_helm, centre, R, vents, H, v, args):
+    """Is the shell there and where it should be? Over the directions the helmet
+    covers, away from vents and edges (one map cell in from them):
+      continuity  a ray from far outside, aimed at the head centre, must first
+                  meet the output near the stock helmet's outer face: a hole in
+                  the shell would let it reach the lattice or liner much deeper.
+                  (Rays from the centre would hit liner and lattice first, so
+                  they cannot test the shell.)
+      offset      how far the output's outer surface stands off the stock outer
+                  face: ~ the skin (wall) or half the band thickness (band).
+      wall        the middle of the stock wall must be solid in the output."""
+    nt, nph, step, TT, D = direction_map(0.5)
+    w = np.sin(TT)
+    good = np.isfinite(R) & ~vents
+    for di in (-1, 0, 1):                          # erode by one cell (azimuth wraps)
+        for dj in (-1, 0, 1):
+            shifted = np.roll(np.roll(good, di, 0), dj, 1)
+            if di == -1:
+                shifted[-1, :] = False
+            elif di == 1:
+                shifted[0, :] = False
+            good &= shifted
+    d = D[good.ravel()]
+    far = 10.0 * H
+    origin = centre + far * d
+    t_helm = S_helm.cast_rays(tensor(np.hstack([origin, -d])))["t_hit"].numpy().astype(float)
+    t_out = S_out.cast_rays(tensor(np.hstack([origin, -d])))["t_hit"].numpy().astype(float)
+    ok = np.isfinite(t_helm)
+    standoff = t_helm[ok] - t_out[ok]                # > 0: output stands outside the stock face
+    # v: the generator's actual grid spacing for this fit
+    expected = (max(2.25 * v, 0.01 * H) / 2) if args.shell == "band" else args.shell_skin * v
+    deep = ~np.isfinite(standoff) | (standoff < -1.0 * v)   # met nothing, or met it well inside the stock face
+    wd = w[good][ok]
+    # middle of the stock wall along rays from the centre
+    t1 = S_helm.cast_rays(tensor(np.hstack([np.tile(centre, (len(d), 1)), d])))["t_hit"].numpy().astype(float)
+    k = np.isfinite(t1)
+    t2 = S_helm.cast_rays(tensor(np.hstack([centre + (t1[k] + 1e-5)[:, None] * d[k], d[k]])))["t_hit"].numpy().astype(float)
+    m = np.isfinite(t2)
+    mid = centre + (t1[k][m] + t2[m] / 2)[:, None] * d[k][m]
+    solid_mid = inside(S_out, mid)
+    mm = 1000.0 if H < 2.0 else 1.0
+    unit = "mm" if mm == 1000.0 else "units"
+    print(f"shell ({args.shell}; {100*(w*good).sum()/w.sum():.1f}% of directions tested, vents and edges excluded):")
+    print(f"   continuity: {100*(wd*deep).sum()/wd.sum():.3f}% of directions reach past the shell (holes)")
+    print(f"   outer surface stands off the stock outer face by median {np.nanmedian(standoff)*mm:.2f} {unit} "
+          f"(p5 {np.nanpercentile(standoff,5)*mm:.2f}, p95 {np.nanpercentile(standoff,95)*mm:.2f}; expected ~{expected*mm:.2f})")
+    print(f"   middle of the stock wall solid: {100*solid_mid.mean():.3f}% of {len(mid)} points")
+    ok_shell = (wd * deep).sum() / wd.sum() < 0.0005 and solid_mid.mean() >= 0.999
+    print(f"step 3b (shell continuous, wall solid): {'PASS' if ok_shell else 'FAIL'}")
+    return "PASS" if ok_shell else "FAIL"
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("output")
     ap.add_argument("fitted_head")
     ap.add_argument("fitted_helmet")
     ap.add_argument("--png", default=None, help="write side/front slice pictures here")
+    ap.add_argument("--step3", action="store_true",
+                    help="also report the room for lattice and the step-3 gate (counts in the exit status)")
+    ap.add_argument("--zone-helmet", default=None,
+                    help="the stock helmet (data/helmet.STL): defines the protection zone as what its "
+                         "default zoom fit (Gap 5) covers, and the front edge to compare with")
+    ap.add_argument("--room-target", type=float, default=0.020, help="step-3 room target, model units (0.02 = 20 mm)")
+    ap.add_argument("--max-size", type=float, nargs=2, default=(0.245, 0.280), metavar=("W", "L"),
+                    help="step-3 size limit, model units")
+    ap.add_argument("--shell", choices=("wall", "band"), default="wall",
+                    help="the generator's --shell (default wall), for the step-3 allowance and the shell checks")
+    ap.add_argument("--shell-skin", type=float, default=0.5, help="the generator's --shell-skin, grid cells")
+    ap.add_argument("--density", type=float, default=1.0, help="g/cm^3 for the mass estimate (printed nylon ~0.95-1.0)")
     args = ap.parse_args()
 
     out = o3d.io.read_triangle_mesh(args.output)
@@ -317,6 +528,9 @@ def main():
     print(f"   head-side liner          {vol(is_liner)*k:8.3f} {unit}")
     print(f"   lattice inside helmet    {vol(is_lattice)*k:8.3f} {unit}")
     print(f"   OUTSIDE the helmet       {vol(is_outside)*k:8.3f} {unit}")
+    if H < 2.0:
+        print(f"   total {vol(solid)*1e6:.0f} cm^3 -> about {vol(solid)*1e3*args.density:.2f} kg at {args.density:g} g/cm^3 "
+              f"(skin {vol(is_skin)*1e6:.0f}, liner {vol(is_liner)*1e6:.0f}, lattice {vol(is_lattice)*1e6:.0f} cm^3)")
     under_vent = np.logical_and.reduce([vents[c] for c in corners])
     print(f"   (liner under the vents   {vol(is_liner & under_vent)*k:8.3f} {unit}; vents are bridged, not open)")
 
@@ -342,6 +556,13 @@ def main():
     if touching.any():
         amount = f"{vol(touching)*1e6:.2f} cm^3" if H < 2 else f"{vol(touching):.3g} {unit}"
         print(f"   note: shell within the head clearance (fit too tight there, not judged): {amount}")
+
+    v_generator, _ = generator_reservation(Th.reshape(-1, 3), np.asarray(helm.vertices), args.shell, args.shell_skin)
+    v3b = shell_checks(S_out, S_helm, centre, R, vents, H, v_generator, args)
+    v3 = None
+    if args.step3:
+        v3 = step3(Th, lid, centre, helm, S_helm, R, U if lid is not None else np.zeros_like(np.isfinite(R)),
+                   step, args, bool((in_way & is_skin).any()))
 
     if args.png:
         import matplotlib
@@ -382,7 +603,7 @@ def main():
         plt.tight_layout(rect=(0, 0.09, 1, 0.96))
         plt.savefig(args.png, dpi=110)
         print(f"slices written to {args.png}")
-    return 0 if v1 == "PASS" and v2 == "PASS" else 1
+    return 0 if v1 == "PASS" and v2 == "PASS" and v3b == "PASS" and v3 in (None, "PASS") else 1
 
 
 if __name__ == "__main__":

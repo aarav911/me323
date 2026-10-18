@@ -2,6 +2,7 @@
 
 #include "donning.h"
 #include "helmet_cavity.h"
+#include "helmet_fit.h"
 
 #include <igl/signed_distance.h>
 
@@ -546,7 +547,10 @@ bool generate_final_helmet(
     const Eigen::MatrixXi& helmet_faces,
     LatticeType lattice_type,
     GeneratedMesh& output,
-    std::string& error)
+    std::string& error,
+    double lattice_room_target,
+    ShellMode shell_mode,
+    double wall_skin_cells)
 {
     if (head_vertices.rows() == 0 || head_faces.rows() == 0 ||
         helmet_vertices.rows() == 0 || helmet_faces.rows() == 0 ||
@@ -560,6 +564,12 @@ bool generate_final_helmet(
         head_lid.size() != static_cast<std::size_t>(head_faces.rows()))
     {
         error = "The head's lid list does not match its triangles.";
+        return false;
+    }
+    if (shell_mode == ShellMode::Wall &&
+        (!std::isfinite(wall_skin_cells) || wall_skin_cells < 0.0 || wall_skin_cells > 3.0))
+    {
+        error = "The wall skin must be between 0 and 3 grid cells.";
         return false;
     }
 
@@ -626,19 +636,60 @@ bool generate_final_helmet(
     }
 
     Eigen::VectorXd head_distance;
-    Eigen::VectorXd helmet_surface_distance;
+    Eigen::VectorXd helmet_distance;   // Band: unsigned; Wall: signed, < 0 inside the wall
     std::cout << "Computing head signed-distance field...\n";
     if (!compute_signed_distance(
             points, head_vertices, head_faces, head_distance, error, "head"))
     {
         return false;
     }
-    std::cout << "Computing helmet distance field (unsigned)...\n";
-    if (!compute_unsigned_distance(
-            points, helmet_vertices, helmet_faces, helmet_surface_distance,
-            error, "helmet"))
+    if (shell_mode == ShellMode::Band)
     {
-        return false;
+        std::cout << "Computing helmet distance field (unsigned)...\n";
+        if (!compute_unsigned_distance(
+                points, helmet_vertices, helmet_faces, helmet_distance,
+                error, "helmet"))
+        {
+            return false;
+        }
+    }
+    else
+    {
+        // The wall's inside comes from the winding number, which libigl takes
+        // as |w| (so the triangles' winding direction does not matter) and
+        // which tolerates the stock mesh's few open slits.
+        std::cout << "Computing helmet wall signed-distance field...\n";
+        if (!compute_signed_distance(
+                points, helmet_vertices, helmet_faces, helmet_distance,
+                error, "helmet wall"))
+        {
+            return false;
+        }
+        // Check the inside really is the wall: the samples inside it should add
+        // up to the mesh's own enclosed volume. If the mesh is not a closed
+        // solid, the winding number has no clean inside and this fails.
+        double mesh_volume = 0.0;
+        for (Eigen::Index f = 0; f < helmet_faces.rows(); ++f)
+        {
+            const Eigen::RowVector3d a = helmet_vertices.row(helmet_faces(f, 0));
+            const Eigen::RowVector3d b = helmet_vertices.row(helmet_faces(f, 1));
+            const Eigen::RowVector3d c = helmet_vertices.row(helmet_faces(f, 2));
+            mesh_volume += a.dot(b.cross(c)) / 6.0;
+        }
+        mesh_volume = std::abs(mesh_volume);
+        const double cell_volume = voxel_size * voxel_size * voxel_size;
+        const double sampled_volume = cell_volume *
+            static_cast<double>((helmet_distance.array() < 0.0).count());
+        std::cout << "  helmet wall: " << sampled_volume << " (inside, sampled) vs "
+                  << mesh_volume << " (mesh) model units cubed\n";
+        if (!(mesh_volume > 0.0) ||
+            std::abs(sampled_volume - mesh_volume) > 0.10 * mesh_volume)
+        {
+            error = "The helmet mesh is not a closed solid wall (sampled inside "
+                    "volume differs from the mesh volume by more than 10%); use "
+                    "--shell band.";
+            return false;
+        }
     }
 
     // "Inside the helmet" = inside the cavity mapped outward from the head's
@@ -684,12 +735,65 @@ bool generate_final_helmet(
         voxel_size * 2.0, head_height * 0.005);
     const double liner_center_distance =
         head_clearance + liner_thickness * 0.5;
-    // Lattice stops half a skin short of the shell's inner face, which is where
-    // the shell skin begins, so the two meet without a gap: the skin band is
-    // measured to the nearest shell point and the cut along the ray, and the
-    // along-ray distance is never the smaller of the two. Under a bridged vent
-    // there is no skin; the lattice sits this far below the vent.
-    const double cavity_margin = shell_thickness * 0.5;
+    // The shell as a field, negative inside, and how far it reaches in from
+    // the stock wall's inner face (what it takes from the room for lattice).
+    //   Band: within half a skin thickness of any face (the original).
+    //   Wall: inside the wall, plus the skin on every face.
+    const double wall_skin = wall_skin_cells * voxel_size;
+    const double shell_inward =
+        shell_mode == ShellMode::Band ? shell_thickness * 0.5 : wall_skin;
+    std::vector<double> shell_field(grid.sample_count());
+    for (std::size_t index = 0; index < grid.sample_count(); ++index)
+    {
+        shell_field[index] = shell_mode == ShellMode::Band
+            ? std::abs(helmet_distance[index]) - shell_thickness * 0.5
+            : helmet_distance[index] - wall_skin;
+    }
+    // Where the lattice stops, short of the shell's inner face along the ray.
+    //   Band: half a skin short, where the band begins, so the two meet without
+    //   a gap (the band is measured to the nearest shell point and the cut
+    //   along the ray, and the along-ray distance is never the smaller).
+    //   Wall: at the inner face itself, so the lattice overlaps the skin by
+    //   wall_skin and fuses with it.
+    // Under a bridged vent there is no wall; the lattice ends this far below
+    // the bridged surface.
+    const double cavity_margin =
+        shell_mode == ShellMode::Band ? shell_thickness * 0.5 : 0.0;
+    std::cout << "Shell: " << (shell_mode == ShellMode::Band
+                                   ? "band (original: padded on both faces), "
+                                   : "stock wall + skin ")
+              << (shell_mode == ShellMode::Band ? shell_thickness : wall_skin)
+              << (shell_mode == ShellMode::Band ? " thick" : " per face")
+              << " (model units).\n";
+
+    // How much room the fit leaves for lattice, for comparing fits (zoom vs
+    // stretch). Report only: nothing below depends on it.
+    {
+        const double reserved = head_clearance + liner_thickness + shell_inward;
+        LatticeRoom room;
+        if (lattice_room(cavity, head_vertices, head_faces, reserved,
+                         lattice_room_target, room, error))
+        {
+            std::cout << "Room for lattice (along rays from the head centre, over "
+                         "the covered, scanned directions; head-to-shell distance "
+                         "minus " << reserved << " for air, liner and the shell's inward part):\n"
+                      << "  min " << room.min << ", p5 " << room.p5 << ", median "
+                      << room.p50 << ", p95 " << room.p95 << ", max " << room.max
+                      << "; medians top / middle / low: " << room.top << " / "
+                      << room.middle << " / " << room.low << " (model units)";
+            if (lattice_room_target > 0.0)
+            {
+                std::cout << "; under " << lattice_room_target << ": "
+                          << fixed1(100.0 * room.under_target) << "% of directions";
+            }
+            std::cout << ".\n";
+        }
+        else
+        {
+            std::cout << "  (room report skipped: " << error << ")\n";
+            error.clear();
+        }
+    }
 
     // Computed once and reused below. `covered`: the direction is one to build
     // in at all (helmet over it, head scanned), however far out the sample is.
@@ -715,7 +819,7 @@ bool generate_final_helmet(
         const bool liner_space = covered[index] &&
             head_distance[index] > head_clearance &&
             head_distance[index] < liner_center_distance + liner_thickness * 0.5;
-        const bool skin = helmet_surface_distance[index] < shell_thickness * 0.5;
+        const bool skin = shell_field[index] < 0.0;
         if (!lattice_space && !liner_space && !skin)
         {
             continue;
@@ -757,7 +861,7 @@ bool generate_final_helmet(
     for (std::size_t k = 0; k < material_samples.size(); ++k)
     {
         const std::size_t index = material_samples[k];
-        if (helmet_surface_distance[index] >= shell_thickness * 0.5)
+        if (shell_field[index] >= 0.0)
         {
             continue;
         }
@@ -889,8 +993,7 @@ bool generate_final_helmet(
     std::size_t lattice_samples = 0;
     for (std::size_t index = 0; index < grid.sample_count(); ++index)
     {
-        const double shell =
-            std::abs(helmet_surface_distance[index]) - shell_thickness * 0.5;
+        const double shell = shell_field[index];
         // The liner follows the swept head, and only in directions the helmet
         // covers where the head was scanned: it used to wrap the whole head,
         // lid and all. Cut by direction only, not by distance: where it meets

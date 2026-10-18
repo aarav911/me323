@@ -11,6 +11,20 @@ enum class LatticeType
     Gyroid
 };
 
+// How the helmet shell is made solid.
+//   Wall: the stock helmet's own wall (inside its closed mesh, by winding
+//         number) plus a thin skin of wall_skin_cells grid cells on every
+//         face, so walls thinner than the grid can resolve do not open up.
+//   Band: the original: everything within half a skin thickness of ANY face,
+//         inner and outer, which pads the wall on both sides (about twice the
+//         stock wall's material) and leaves hollows where the wall is thicker
+//         than the band. For helmet meshes that are not closed solids.
+enum class ShellMode
+{
+    Wall,
+    Band
+};
+
 struct GeneratedMesh
 {
     Eigen::MatrixXd vertices;
@@ -29,4 +43,7 @@ bool generate_final_helmet(
     const Eigen::MatrixXi& helmet_faces,
     LatticeType lattice_type,
     GeneratedMesh& output,
-    std::string& error);
+    std::string& error,
+    double lattice_room_target = 0.0,    // for the room report; 0 = none
+    ShellMode shell_mode = ShellMode::Wall,
+    double wall_skin_cells = 0.5);

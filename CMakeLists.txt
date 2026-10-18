@@ -26,6 +26,8 @@ add_executable(me323
     src/helmet_cavity.cpp
     src/head_lid.cpp
     src/donning.cpp
+    src/fit_config.cpp
+    src/helmet_fit.cpp
 )
 
 target_link_libraries(me323
