@@ -259,3 +259,60 @@ void swept_head_distance(
         swept[index] = best;
     }, 1000);
 }
+
+double swept_head_distance_at(
+    const GridField& head_distance,
+    const Eigen::RowVector3d& direction,
+    const Eigen::RowVector3d& box_min,
+    const Eigen::RowVector3d& box_max,
+    double margin,
+    double step,
+    const Eigen::RowVector3d& p,
+    double at_p)
+{
+    double best = at_p;
+    if (best < -margin)
+    {
+        return best;
+    }
+    // The part of the ray p + t * direction, t >= 0, inside the box.
+    double t_enter = 0.0;
+    double t_leave = std::numeric_limits<double>::infinity();
+    for (int axis = 0; axis < 3; ++axis)
+    {
+        if (direction[axis] == 0.0)
+        {
+            if (p[axis] < box_min[axis] || p[axis] > box_max[axis])
+            {
+                return best;
+            }
+            continue;
+        }
+        double a = (box_min[axis] - p[axis]) / direction[axis];
+        double b = (box_max[axis] - p[axis]) / direction[axis];
+        if (a > b)
+        {
+            std::swap(a, b);
+        }
+        t_enter = std::max(t_enter, a);
+        t_leave = std::min(t_leave, b);
+    }
+    if (!(t_enter <= t_leave))
+    {
+        return best;
+    }
+    // Same steps as swept_head_distance(); a t = 0 step is taken by at_p.
+    for (std::size_t s = 0;; ++s)
+    {
+        const double t = std::min(t_enter + static_cast<double>(s) * step, t_leave);
+        if (t > 0.0)
+        {
+            best = std::min(best, head_distance.trilinear(p + t * direction));
+        }
+        if (best < -margin || t >= t_leave)
+        {
+            break;
+        }
+    }
+    return best;
+}

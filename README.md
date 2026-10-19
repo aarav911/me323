@@ -682,6 +682,18 @@ opening a viewer (useful for batch runs or automated checks). Add
 `--export-fit` to also write `fitted_head.stl` and `fitted_helmet.stl`, the
 exact meshes the generator received (the head keeps its lid marker).
 
+`--fine-spacing <size>` (head-file units; 0.0005 = 0.5 mm) takes the surface
+from a finer grid: the coarse grid (about head height / 120, capped at 4 M
+samples) divided k times, k the smallest whole number giving at most the
+requested spacing. Only the blocks the shell, liner or lattice surface can pass
+through are sampled, in parallel; the fit, cavity, lift-off and cell pitch stay
+on the coarse grid, and the wall skin is half a fine cell. Without the flag the
+output is exactly what it was. For the Run_2 stretch fit, 0.0005 gives a
+0.46 mm surface grid, 36.5 M triangles (a 1.83 GB STL) in about 90 s using up to
+13 GB of memory. `--fine-exact`, `--fine-all-blocks` and `--fine-block-cells <n>`
+are for testing (exact distances everywhere, no skipped blocks, block size); the
+mesh must not depend on them.
+
 `tools/check_output.py` independently checks an output (Python with numpy,
 scipy, open3d; matplotlib for `--png`), with Open3D rather than libigl. It sorts
 the solid material into helmet skin, head-side liner, lattice inside the
@@ -692,7 +704,7 @@ the head passes through for the best straight lift-off direction. It also
 checks the shell (step 3b): rays aimed at the head from outside must meet the
 output near the stock outer face (no holes), and the middle of the stock wall
 must be solid; and it estimates the mass (`--density`, default 1.0 g/cm³).
-`--shell` / `--shell-skin` must match the generator's:
+`--shell` / `--shell-skin` / `--fine-spacing` must match the generator's:
 
 ``` bash
 ./build/me323 --lattice auxetic --generate-only --export-fit

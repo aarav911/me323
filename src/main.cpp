@@ -170,6 +170,10 @@ int main(int argc, char** argv)
     double lattice_room_target = 0.0;  // model units; 0 = no target in the report
     ShellMode shell_mode = ShellMode::Wall;
     double wall_skin_cells = 0.5;
+    double fine_spacing = 0.0;         // model units; 0 = surface from the coarse grid
+    bool fine_exact = false;           // tests: exact distances at every fine sample
+    bool fine_all_blocks = false;      // tests: evaluate every block, skip none
+    unsigned fine_block_cells = 8;     // tests: block size in coarse cells
     for (int argument = 1; argument < argc; ++argument)
     {
         const std::string option = argv[argument];
@@ -233,6 +237,37 @@ int main(int argc, char** argv)
                 return 2;
             }
         }
+        else if (option == "--fine-spacing" && argument + 1 < argc)
+        {
+            char* end = nullptr;
+            fine_spacing = std::strtod(argv[++argument], &end);
+            if (end == argv[argument] || *end != '\0' ||
+                !std::isfinite(fine_spacing) || fine_spacing < 0.0)
+            {
+                std::cerr << "--fine-spacing needs a non-negative number in the head "
+                             "file's units (0.0005 = 0.5 mm for a head in metres; 0 = off).\n";
+                return 2;
+            }
+        }
+        else if (option == "--fine-exact")
+        {
+            fine_exact = true;
+        }
+        else if (option == "--fine-all-blocks")
+        {
+            fine_all_blocks = true;
+        }
+        else if (option == "--fine-block-cells" && argument + 1 < argc)
+        {
+            char* end = nullptr;
+            const long cells = std::strtol(argv[++argument], &end, 10);
+            if (end == argv[argument] || *end != '\0' || cells < 1 || cells > 64)
+            {
+                std::cerr << "--fine-block-cells needs a whole number from 1 to 64.\n";
+                return 2;
+            }
+            fine_block_cells = static_cast<unsigned>(cells);
+        }
         else if (option == "--lattice" && argument + 1 < argc)
         {
             const std::string requested = argv[++argument];
@@ -251,7 +286,10 @@ int main(int argc, char** argv)
         {
             std::cerr << "Usage: me323 [--lattice auxetic|tpms] [--generate-only]"
                          " [--export-fit] [--fit zoom|stretch] [--lattice-room <size>]"
-                         " [--shell wall|band] [--shell-skin <cells>]\n";
+                         " [--shell wall|band] [--shell-skin <cells>]"
+                         " [--fine-spacing <size>]\n"
+                         "       test options: [--fine-exact] [--fine-all-blocks]"
+                         " [--fine-block-cells <n>]\n";
             return 2;
         }
     }
@@ -462,10 +500,17 @@ int main(int argc, char** argv)
 
         GeneratedMesh generated;
         std::string error;
+        GenerationOptions options;
+        options.lattice_room_target = lattice_room_target;
+        options.shell_mode = shell_mode;
+        options.wall_skin_cells = wall_skin_cells;
+        options.fine_spacing = fine_spacing;
+        options.fine_exact = fine_exact;
+        options.fine_all_blocks = fine_all_blocks;
+        options.fine_block_cells = fine_block_cells;
         if (!generate_final_helmet(
                 fitted_head, F_head, head_lid.faces, fitted_helmet, F_helmet,
-                type, generated, error, lattice_room_target, shell_mode,
-                wall_skin_cells))
+                type, generated, error, options))
         {
             config_status = error;
             std::cerr << "Lattice generation failed: " << error << '\n';

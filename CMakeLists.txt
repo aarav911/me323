@@ -28,6 +28,9 @@ add_executable(me323
     src/donning.cpp
     src/fit_config.cpp
     src/helmet_fit.cpp
+    src/lattice_struts.cpp
+    src/mesh_distance.cpp
+    src/fine_grid.cpp
 )
 
 target_link_libraries(me323

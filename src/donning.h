@@ -80,3 +80,19 @@ void swept_head_distance(
     double margin,
     const std::vector<std::size_t>& samples,
     std::vector<double>& swept);
+
+// The same, at one point p anywhere (not only at grid samples), stepping every
+// `step` along the ray. `at_p` is the head distance at p itself (exact, from
+// the mesh), which stands for the t = 0 term; the grid is only interpolated
+// for t > 0. With p a grid sample, at_p its grid value and step half the
+// spacing, this takes the same steps as swept_head_distance(); the two can
+// differ only by rounding in that function's interpolated t = 0 sample.
+double swept_head_distance_at(
+    const GridField& head_distance,
+    const Eigen::RowVector3d& direction,
+    const Eigen::RowVector3d& box_min,
+    const Eigen::RowVector3d& box_max,
+    double margin,
+    double step,
+    const Eigen::RowVector3d& p,
+    double at_p);

@@ -1,20 +1,26 @@
 #include "lattice_generator.h"
 
 #include "donning.h"
+#include "fine_grid.h"
 #include "helmet_cavity.h"
 #include "helmet_fit.h"
+#include "lattice_struts.h"
+#include "mesh_distance.h"
+
+#include <igl/parallel_for.h>
 
 #include <igl/signed_distance.h>
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <iostream>
 #include <limits>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -22,7 +28,6 @@ namespace
 {
 
 constexpr std::size_t max_grid_samples = 4'000'000;
-constexpr double pi = 3.14159265358979323846;
 
 // Formats without touching std::cout's own flags, which later output relies on.
 std::string fixed1(double value)
@@ -51,61 +56,6 @@ std::string describe_lift_off(const LiftOff& lift)
             + (lift.side_degrees < 0.0 ? "-X" : "+X");
     }
     return text;
-}
-
-bool has_closed_two_manifold_edges(
-    const Eigen::MatrixXi& faces,
-    const Eigen::MatrixXd& vertices,
-    const Eigen::RowVector3d& grid_min,
-    const Eigen::RowVector3d& grid_max,
-    double voxel_size,
-    std::size_t& boundary_edges,
-    std::size_t& nonmanifold_edges,
-    std::size_t& boundary_grid_edges)
-{
-    std::unordered_map<std::uint64_t, unsigned int> edge_counts;
-    edge_counts.reserve(static_cast<std::size_t>(faces.rows()) * 2);
-    for (Eigen::Index face = 0; face < faces.rows(); ++face)
-    {
-        for (int edge = 0; edge < 3; ++edge)
-        {
-            const std::uint32_t a = static_cast<std::uint32_t>(faces(face, edge));
-            const std::uint32_t b = static_cast<std::uint32_t>(faces(face, (edge + 1) % 3));
-            const std::uint32_t low = std::min(a, b);
-            const std::uint32_t high = std::max(a, b);
-            const std::uint64_t key =
-                (static_cast<std::uint64_t>(low) << 32) | high;
-            unsigned int& count = edge_counts[key];
-            ++count;
-        }
-    }
-    boundary_edges = 0;
-    nonmanifold_edges = 0;
-    boundary_grid_edges = 0;
-    for (const auto& [key, count] : edge_counts)
-    {
-        if (count == 1)
-        {
-            ++boundary_edges;
-            const auto a = static_cast<Eigen::Index>(key >> 32);
-            const auto b = static_cast<Eigen::Index>(key & 0xffffffffu);
-            for (const Eigen::Index vertex : {a, b})
-            {
-                const Eigen::RowVector3d position = vertices.row(vertex);
-                if ((position - grid_min).minCoeff() < voxel_size * 1e-5 ||
-                    (grid_max - position).minCoeff() < voxel_size * 1e-5)
-                {
-                    ++boundary_grid_edges;
-                    break;
-                }
-            }
-        }
-        else if (count != 2)
-        {
-            ++nonmanifold_edges;
-        }
-    }
-    return boundary_edges == 0 && nonmanifold_edges == 0;
 }
 
 struct Grid
@@ -142,349 +92,6 @@ Eigen::RowVector3d grid_point(const Grid& grid, std::size_t index)
     const unsigned z = static_cast<unsigned>(
         index / (static_cast<std::size_t>(grid.nx) * grid.ny));
     return grid.point(x, y, z);
-}
-
-void orient_triangle(
-    Eigen::Vector3i& triangle,
-    const std::vector<Eigen::RowVector3d>& vertices,
-    const Eigen::RowVector3d& inside_center,
-    const Eigen::RowVector3d& outside_center)
-{
-    const Eigen::RowVector3d a = vertices[triangle[0]];
-    const Eigen::RowVector3d b = vertices[triangle[1]];
-    const Eigen::RowVector3d c = vertices[triangle[2]];
-    if ((b - a).cross(c - a).dot(outside_center - inside_center) < 0.0)
-    {
-        std::swap(triangle[1], triangle[2]);
-    }
-}
-
-void marching_tetrahedra(
-    const Grid& grid,
-    const Eigen::VectorXd& field,
-    double isovalue,
-    Eigen::MatrixXd& vertices_out,
-    Eigen::MatrixXi& faces_out)
-{
-    constexpr int cube_offsets[8][3] = {
-        {0, 0, 0}, {1, 0, 0}, {1, 1, 0}, {0, 1, 0},
-        {0, 0, 1}, {1, 0, 1}, {1, 1, 1}, {0, 1, 1}
-    };
-    constexpr int tetrahedra[6][4] = {
-        {0, 5, 1, 6}, {0, 1, 2, 6}, {0, 2, 3, 6},
-        {0, 3, 7, 6}, {0, 7, 4, 6}, {0, 4, 5, 6}
-    };
-
-    std::vector<Eigen::RowVector3d> vertices;
-    std::vector<Eigen::Vector3i> faces;
-    std::unordered_map<std::uint64_t, int> edge_vertices;
-    edge_vertices.reserve(static_cast<std::size_t>(field.size()) / 2);
-
-    const auto vertex_for_edge = [&](std::size_t a, std::size_t b) -> int
-    {
-        if (field[a] == isovalue)
-        {
-            const std::uint64_t key = (std::uint64_t{1} << 63) | a;
-            const auto [it, inserted] =
-                edge_vertices.emplace(key, static_cast<int>(vertices.size()));
-            if (inserted)
-            {
-                vertices.emplace_back(grid_point(grid, a));
-            }
-            return it->second;
-        }
-        if (field[b] == isovalue)
-        {
-            const std::uint64_t key = (std::uint64_t{1} << 63) | b;
-            const auto [it, inserted] =
-                edge_vertices.emplace(key, static_cast<int>(vertices.size()));
-            if (inserted)
-            {
-                vertices.emplace_back(grid_point(grid, b));
-            }
-            return it->second;
-        }
-
-        const std::size_t low = std::min(a, b);
-        const std::size_t high = std::max(a, b);
-        const std::uint64_t key =
-            (static_cast<std::uint64_t>(low) << 32) | high;
-        const auto [it, inserted] =
-            edge_vertices.emplace(key, static_cast<int>(vertices.size()));
-        if (inserted)
-        {
-            const double t = (isovalue - field[a]) / (field[b] - field[a]);
-            vertices.emplace_back(
-                grid_point(grid, a)
-                + t * (grid_point(grid, b) - grid_point(grid, a)));
-        }
-        return it->second;
-    };
-
-    const auto append_oriented = [&](int a, int b, int c,
-                                     const Eigen::RowVector3d& inside_center,
-                                     const Eigen::RowVector3d& outside_center)
-    {
-        Eigen::Vector3i triangle(a, b, c);
-        if (triangle[0] == triangle[1] || triangle[1] == triangle[2] ||
-            triangle[2] == triangle[0])
-        {
-            return;
-        }
-        orient_triangle(triangle, vertices, inside_center, outside_center);
-        faces.push_back(triangle);
-    };
-
-    for (unsigned z = 0; z + 1 < grid.nz; ++z)
-    {
-        for (unsigned y = 0; y + 1 < grid.ny; ++y)
-        {
-            for (unsigned x = 0; x + 1 < grid.nx; ++x)
-            {
-                std::array<std::size_t, 8> cube_indices;
-                for (int corner = 0; corner < 8; ++corner)
-                {
-                    const unsigned gx = x + cube_offsets[corner][0];
-                    const unsigned gy = y + cube_offsets[corner][1];
-                    const unsigned gz = z + cube_offsets[corner][2];
-                    cube_indices[corner] = grid.index(gx, gy, gz);
-                }
-
-                for (const auto& tetra : tetrahedra)
-                {
-                    std::array<int, 4> inside;
-                    std::array<int, 4> outside;
-                    int inside_count = 0;
-                    int outside_count = 0;
-                    Eigen::RowVector3d inside_center = Eigen::RowVector3d::Zero();
-                    Eigen::RowVector3d outside_center = Eigen::RowVector3d::Zero();
-                    for (int corner = 0; corner < 4; ++corner)
-                    {
-                        const int local = tetra[corner];
-                        const std::size_t index = cube_indices[local];
-                        if (field[index] < isovalue)
-                        {
-                            inside[inside_count++] = local;
-                            inside_center += grid_point(grid, index);
-                        }
-                        else
-                        {
-                            outside[outside_count++] = local;
-                            outside_center += grid_point(grid, index);
-                        }
-                    }
-                    if (inside_count == 0 || inside_count == 4)
-                    {
-                        continue;
-                    }
-                    inside_center /= inside_count;
-                    outside_center /= outside_count;
-
-                    if (inside_count == 1)
-                    {
-                        const int a = vertex_for_edge(
-                            cube_indices[inside[0]], cube_indices[outside[0]]);
-                        const int b = vertex_for_edge(
-                            cube_indices[inside[0]], cube_indices[outside[1]]);
-                        const int c = vertex_for_edge(
-                            cube_indices[inside[0]], cube_indices[outside[2]]);
-                        append_oriented(a, b, c, inside_center, outside_center);
-                    }
-                    else if (inside_count == 3)
-                    {
-                        const int a = vertex_for_edge(
-                            cube_indices[outside[0]], cube_indices[inside[0]]);
-                        const int b = vertex_for_edge(
-                            cube_indices[outside[0]], cube_indices[inside[1]]);
-                        const int c = vertex_for_edge(
-                            cube_indices[outside[0]], cube_indices[inside[2]]);
-                        append_oriented(a, b, c, inside_center, outside_center);
-                    }
-                    else
-                    {
-                        const int a = vertex_for_edge(
-                            cube_indices[inside[0]], cube_indices[outside[0]]);
-                        const int b = vertex_for_edge(
-                            cube_indices[inside[0]], cube_indices[outside[1]]);
-                        const int c = vertex_for_edge(
-                            cube_indices[inside[1]], cube_indices[outside[0]]);
-                        const int d = vertex_for_edge(
-                            cube_indices[inside[1]], cube_indices[outside[1]]);
-                        append_oriented(a, b, c, inside_center, outside_center);
-                        append_oriented(b, d, c, inside_center, outside_center);
-                    }
-                }
-            }
-        }
-    }
-
-    vertices_out.resize(static_cast<Eigen::Index>(vertices.size()), 3);
-    for (std::size_t i = 0; i < vertices.size(); ++i)
-    {
-        vertices_out.row(static_cast<Eigen::Index>(i)) = vertices[i];
-    }
-    faces_out.resize(static_cast<Eigen::Index>(faces.size()), 3);
-    for (std::size_t i = 0; i < faces.size(); ++i)
-    {
-        faces_out.row(static_cast<Eigen::Index>(i)) = faces[i];
-    }
-}
-
-double point_segment_distance(
-    const Eigen::Vector3d& point,
-    const Eigen::Vector3d& start,
-    const Eigen::Vector3d& end)
-{
-    const Eigen::Vector3d edge = end - start;
-    const double edge_squared_length = edge.squaredNorm();
-    const double t = edge_squared_length > 0.0
-        ? std::clamp((point - start).dot(edge) / edge_squared_length, 0.0, 1.0)
-        : 0.0;
-    return (point - (start + t * edge)).norm();
-}
-
-void rasterize_strut(
-    const Grid& grid,
-    const Eigen::Vector3d& start,
-    const Eigen::Vector3d& end,
-    double radius,
-    std::vector<float>& distances)
-{
-    Eigen::Vector3d min = start.cwiseMin(end).array() - radius;
-    Eigen::Vector3d max = start.cwiseMax(end).array() + radius;
-    Eigen::Vector3i low;
-    Eigen::Vector3i high;
-    for (int axis = 0; axis < 3; ++axis)
-    {
-        low[axis] = static_cast<int>(std::floor(
-            (min[axis] - grid.minimum[axis]) / grid.step[axis]));
-        high[axis] = static_cast<int>(std::ceil(
-            (max[axis] - grid.minimum[axis]) / grid.step[axis]));
-    }
-    low = low.cwiseMax(Eigen::Vector3i::Zero());
-    high = high.cwiseMin(Eigen::Vector3i(
-        static_cast<int>(grid.nx) - 1,
-        static_cast<int>(grid.ny) - 1,
-        static_cast<int>(grid.nz) - 1));
-
-    for (int z = low.z(); z <= high.z(); ++z)
-    {
-        for (int y = low.y(); y <= high.y(); ++y)
-        {
-            for (int x = low.x(); x <= high.x(); ++x)
-            {
-                const Eigen::Vector3d sample = grid.point(x, y, z);
-                const double distance =
-                    point_segment_distance(sample, start, end) - radius;
-                float& current = distances[grid.index(x, y, z)];
-                current = std::min(current, static_cast<float>(distance));
-            }
-        }
-    }
-}
-
-std::array<Eigen::Vector3d, 6> reentrant_cell(
-    double center_x,
-    double center_z,
-    double cell_size,
-    double inward_fraction)
-{
-    const double half_x = cell_size * 0.5;
-    const double half_z = cell_size * 0.5;
-    const double inward = half_x * inward_fraction;
-    return {{
-        {center_x - half_x, 0.0, center_z - half_z},
-        {center_x - inward, 0.0, center_z},
-        {center_x - half_x, 0.0, center_z + half_z},
-        {center_x + half_x, 0.0, center_z + half_z},
-        {center_x + inward, 0.0, center_z},
-        {center_x + half_x, 0.0, center_z - half_z}
-    }};
-}
-
-void build_auxetic_field(
-    const Grid& grid,
-    double cell_size,
-    const Eigen::RowVector3d& anchor,
-    std::vector<float>& field)
-{
-    const double radius = cell_size * 0.12;
-    const double inward_fraction = 0.42;
-    const Eigen::RowVector3d maximum =
-        grid.minimum + grid.step.cwiseProduct(Eigen::RowVector3d(
-            grid.nx - 1, grid.ny - 1, grid.nz - 1));
-
-    const int first_x = static_cast<int>(std::floor(
-        (grid.minimum.x() - anchor.x()) / cell_size)) - 1;
-    const int last_x = static_cast<int>(std::ceil(
-        (maximum.x() - anchor.x()) / cell_size)) + 1;
-    const int first_z = static_cast<int>(std::floor(
-        (grid.minimum.z() - anchor.z()) / cell_size)) - 1;
-    const int last_z = static_cast<int>(std::ceil(
-        (maximum.z() - anchor.z()) / cell_size)) + 1;
-    const int first_y = static_cast<int>(std::floor(
-        (grid.minimum.y() - anchor.y()) / cell_size)) - 1;
-    const int last_y = static_cast<int>(std::ceil(
-        (maximum.y() - anchor.y()) / cell_size)) + 1;
-
-    for (int ix = first_x; ix <= last_x; ++ix)
-    {
-        for (int iz = first_z; iz <= last_z; ++iz)
-        {
-            const auto base = reentrant_cell(
-                anchor.x() + ix * cell_size,
-                anchor.z() + iz * cell_size,
-                cell_size, inward_fraction);
-            for (int iy = first_y; iy <= last_y; ++iy)
-            {
-                std::array<Eigen::Vector3d, 6> lower;
-                std::array<Eigen::Vector3d, 6> upper;
-                for (std::size_t node = 0; node < base.size(); ++node)
-                {
-                    lower[node] = base[node];
-                    lower[node].y() = anchor.y() + iy * cell_size;
-                    upper[node] = base[node];
-                    upper[node].y() = anchor.y() + (iy + 1) * cell_size;
-                }
-
-                for (std::size_t node = 0; node < base.size(); ++node)
-                {
-                    const std::size_t next = (node + 1) % base.size();
-                    rasterize_strut(grid, lower[node], lower[next], radius, field);
-                    rasterize_strut(grid, lower[node], upper[node], radius, field);
-                }
-            }
-        }
-    }
-}
-
-void build_gyroid_field(
-    const Grid& grid,
-    double cell_size,
-    const Eigen::RowVector3d& anchor,
-    std::vector<float>& field)
-{
-    const double wall_thickness = cell_size * 0.20;
-    const double distance_scale = cell_size / (2.0 * pi * std::sqrt(3.0));
-    for (unsigned z = 0; z < grid.nz; ++z)
-    {
-        for (unsigned y = 0; y < grid.ny; ++y)
-        {
-            for (unsigned x = 0; x < grid.nx; ++x)
-            {
-                const Eigen::RowVector3d point = grid.point(x, y, z);
-                const double px = 2.0 * pi * (point.x() - anchor.x()) / cell_size;
-                const double py = 2.0 * pi * (point.y() - anchor.y()) / cell_size;
-                const double pz = 2.0 * pi * (point.z() - anchor.z()) / cell_size;
-                const double gyroid =
-                    std::sin(px) * std::cos(py)
-                    + std::sin(py) * std::cos(pz)
-                    + std::sin(pz) * std::cos(px);
-                field[grid.index(x, y, z)] = static_cast<float>(
-                    std::abs(gyroid) * distance_scale - wall_thickness * 0.5);
-            }
-        }
-    }
 }
 
 bool compute_signed_distance(
@@ -537,6 +144,381 @@ bool compute_unsigned_distance(
     return true;
 }
 
+// What the fine surface needs from the coarse pass.
+struct FineContext
+{
+    const Grid& grid;
+    const FineGrid& fine;
+    const GenerationOptions& options;
+    const Eigen::MatrixXd& head_vertices;
+    const Eigen::MatrixXi& head_faces;
+    const Eigen::MatrixXd& helmet_vertices;
+    const Eigen::MatrixXi& helmet_faces;
+    const HelmetCavity& cavity;
+    const LiftOff& lift;
+    const Eigen::VectorXd& head_distance;
+    const std::vector<double>& shell_field;      // coarse samples, with the fine skin
+    const std::vector<double>& swept;
+    const std::vector<char>& swept_computed;
+    const std::vector<double>& inside_helmet;
+    const std::vector<char>& covered_near;
+    Eigen::RowVector3d head_min;
+    Eigen::RowVector3d head_max;
+    Eigen::RowVector3d grid_last;
+    LatticeType lattice_type;
+    double cell_size;
+    Eigen::RowVector3d lattice_anchor;
+    double shell_thickness;
+    double wall_skin;
+    double liner_center_distance;
+    double liner_thickness;
+    double head_clearance;
+    double cavity_margin;
+};
+
+// The final solid, sampled on the fine grid in the blocks a surface can pass
+// through, combined exactly as the coarse path does (shell, liner, clipped
+// lattice). Distances are taken from the meshes, exactly, wherever a value can
+// be near zero; elsewhere a bound with the right sign stands in. All three
+// distance fields change by at most the distance moved (the swept head's is
+// the distance to the swept volume), so if every corner of the coarse cell
+// around a sample is further than a cell diagonal plus a margin from zero, the
+// value at the sample is too, on the same side.
+bool generate_fine_surface(const FineContext& c, GeneratedMesh& output, std::string& error)
+{
+    using clock = std::chrono::steady_clock;
+    const auto start = clock::now();
+    const Grid& grid = c.grid;
+    const FineGrid& fine = c.fine;
+    const double v = grid.step.x();
+    const double diagonal = std::sqrt(3.0) * v;
+    // A bound stands in for a distance only where it is at least v from zero
+    // (well clear of the isovalue): the value at a sample is within `reach`
+    // of every corner of its coarse cell, so a bound is taken only where the
+    // corners are `reach + v` clear, and the bound itself is corner - reach.
+    const double near = diagonal + v;                    // shell: reach = diagonal
+    const double swept_reach = diagonal + 0.25 * v;      // + the coarse sweep's own error
+    const double swept_near = swept_reach + v;
+    const double liner_outer = c.liner_center_distance + c.liner_thickness * 0.5;
+    const double sweep_margin = 7.0 * v;                 // as for the coarse sweep
+    const Eigen::RowVector3d sweep_box_min = c.head_min.array() - sweep_margin;
+    const Eigen::RowVector3d sweep_box_max = c.head_max.array() + sweep_margin;
+    const bool band = c.options.shell_mode == ShellMode::Band;
+
+    // Coarse cells that can hold a surface of the solid, grown by one cell.
+    const unsigned cx = grid.nx - 1;
+    const unsigned cy = grid.ny - 1;
+    const unsigned cz = grid.nz - 1;
+    const auto cell_index = [&](unsigned x, unsigned y, unsigned z)
+    {
+        return static_cast<std::size_t>(x) + static_cast<std::size_t>(cx)
+            * (static_cast<std::size_t>(y) + static_cast<std::size_t>(cy) * z);
+    };
+    std::vector<char> cell_active(static_cast<std::size_t>(cx) * cy * cz, 0);
+    for (unsigned z = 0; z < cz; ++z)
+    {
+        for (unsigned y = 0; y < cy; ++y)
+        {
+            for (unsigned x = 0; x < cx; ++x)
+            {
+                bool any = c.options.fine_all_blocks;
+                for (int corner = 0; corner < 8 && !any; ++corner)
+                {
+                    const std::size_t i = grid.index(
+                        x + (corner & 1), y + ((corner >> 1) & 1), z + ((corner >> 2) & 1));
+                    if (std::abs(c.shell_field[i]) <= near)
+                    {
+                        any = true;                                  // shell
+                    }
+                    else if (c.covered_near[i] &&
+                             (c.swept[i] <= liner_outer + swept_near ||   // liner
+                              (c.inside_helmet[i] < 3.0 * v &&            // lattice
+                               c.swept[i] >= c.head_clearance - swept_near)))
+                    {
+                        any = true;
+                    }
+                }
+                cell_active[cell_index(x, y, z)] = any ? 1 : 0;
+            }
+        }
+    }
+    std::vector<char> cell_grown(cell_active.size(), 0);
+    for (unsigned z = 0; z < cz; ++z)
+    {
+        for (unsigned y = 0; y < cy; ++y)
+        {
+            for (unsigned x = 0; x < cx; ++x)
+            {
+                if (!cell_active[cell_index(x, y, z)])
+                {
+                    continue;
+                }
+                for (unsigned zz = (z > 0 ? z - 1 : 0); zz <= std::min(z + 1, cz - 1); ++zz)
+                {
+                    for (unsigned yy = (y > 0 ? y - 1 : 0); yy <= std::min(y + 1, cy - 1); ++yy)
+                    {
+                        for (unsigned xx = (x > 0 ? x - 1 : 0); xx <= std::min(x + 1, cx - 1); ++xx)
+                        {
+                            cell_grown[cell_index(xx, yy, zz)] = 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    std::size_t total_blocks = 0;
+    const std::vector<FineBlock> blocks = active_blocks(
+        fine, grid.nx, grid.ny, grid.nz, cell_grown, c.options.fine_block_cells, total_blocks);
+    std::size_t evaluated = 0;
+    for (const FineBlock& block : blocks)
+    {
+        evaluated += block.sample_count();
+    }
+    constexpr std::size_t max_evaluated = 400'000'000;
+    std::cout << "Fine surface grid: spacing " << fine.spacing << " (coarse / " << fine.k
+              << "), " << fine.nx << " x " << fine.ny << " x " << fine.nz << "; "
+              << blocks.size() << " of " << total_blocks << " blocks hold the helmet layer ("
+              << evaluated << " samples to evaluate).\n";
+    if (evaluated > max_evaluated)
+    {
+        error = "The fine grid would evaluate " + std::to_string(evaluated) +
+            " samples (limit " + std::to_string(max_evaluated) + "); use a coarser "
+            "--fine-spacing.";
+        return false;
+    }
+
+    MeshDistance head_mesh;
+    MeshDistance helmet_mesh;
+    if (!head_mesh.init(c.head_vertices, c.head_faces, true, error) ||
+        !helmet_mesh.init(c.helmet_vertices, c.helmet_faces, !band, error))
+    {
+        return false;
+    }
+    GridField coarse_head;
+    coarse_head.minimum = grid.minimum;
+    coarse_head.spacing = v;
+    coarse_head.nx = static_cast<int>(grid.nx);
+    coarse_head.ny = static_cast<int>(grid.ny);
+    coarse_head.nz = static_cast<int>(grid.nz);
+    coarse_head.values = c.head_distance.data();
+
+    // Struts, each with its box widened by the pad: past the radius by more
+    // than a fine sample diagonal, so every sample next to a strut's surface
+    // gets its true distance (not "far"), which marching needs on both sides.
+    // A block takes a strut when the strut's sample range (computed exactly as
+    // rasterize_strut() computes it, floor/ceil included) meets the block's:
+    // then a sample shared by two blocks gets the same struts in both, and the
+    // two blocks agree on its value (and so on the shared mesh vertices).
+    std::vector<Strut> struts;
+    std::vector<std::array<long, 6>> strut_range;   // low x, y, z, high x, y, z
+    const double radius = auxetic_strut_radius(c.cell_size);
+    const double pad = radius + 2.0 * fine.spacing;
+    if (c.lattice_type == LatticeType::Auxetic)
+    {
+        struts = auxetic_struts(grid.minimum, c.grid_last, c.cell_size, c.lattice_anchor);
+        strut_range.reserve(struts.size());
+        for (const Strut& strut : struts)
+        {
+            const Eigen::Vector3d low = strut.a.cwiseMin(strut.b).array() - pad;
+            const Eigen::Vector3d high = strut.a.cwiseMax(strut.b).array() + pad;
+            std::array<long, 6> range;
+            for (int axis = 0; axis < 3; ++axis)
+            {
+                range[axis] = static_cast<long>(std::floor(
+                    (low[axis] - fine.minimum[axis]) / fine.spacing));
+                range[3 + axis] = static_cast<long>(std::ceil(
+                    (high[axis] - fine.minimum[axis]) / fine.spacing));
+            }
+            strut_range.push_back(range);
+        }
+    }
+
+    std::atomic<std::size_t> exact_shell{0};
+    std::atomic<std::size_t> exact_swept{0};
+    std::atomic<std::size_t> lattice_points{0};
+    const BlockField field = [&](const FineBlock& block, std::vector<double>& values)
+    {
+        std::vector<double> lattice(block.sample_count(), std::numeric_limits<double>::infinity());
+        if (c.lattice_type == LatticeType::Auxetic)
+        {
+            SampleBox box;
+            box.origin = fine.minimum;
+            box.spacing = fine.spacing;
+            box.first[0] = block.x0;
+            box.first[1] = block.y0;
+            box.first[2] = block.z0;
+            box.count[0] = block.sx;
+            box.count[1] = block.sy;
+            box.count[2] = block.sz;
+            for (std::size_t s = 0; s < struts.size(); ++s)
+            {
+                const std::array<long, 6>& range = strut_range[s];
+                bool overlaps = true;
+                for (int axis = 0; axis < 3; ++axis)
+                {
+                    overlaps = overlaps && range[axis] <= box.first[axis] + box.count[axis] - 1 &&
+                               range[3 + axis] >= box.first[axis];
+                }
+                if (overlaps)
+                {
+                    rasterize_strut<double>(box, struts[s], radius, pad, lattice);
+                }
+            }
+        }
+        std::size_t local_shell = 0;
+        std::size_t local_swept = 0;
+        std::size_t local_lattice = 0;
+        for (unsigned k = 0; k < block.sz; ++k)
+        {
+            for (unsigned j = 0; j < block.sy; ++j)
+            {
+                for (unsigned i = 0; i < block.sx; ++i)
+                {
+                    const unsigned gx = block.x0 + i;
+                    const unsigned gy = block.y0 + j;
+                    const unsigned gz = block.z0 + k;
+                    const Eigen::RowVector3d p = fine.point(gx, gy, gz);
+                    const std::size_t local = block.local(i, j, k);
+                    if (c.lattice_type == LatticeType::Gyroid)
+                    {
+                        lattice[local] = gyroid_distance(p, c.cell_size, c.lattice_anchor);
+                    }
+                    // The coarse cell around the sample (integer arithmetic:
+                    // the fine grid is the coarse one subdivided k times).
+                    const unsigned qx = std::min(gx / fine.k, grid.nx - 2);
+                    const unsigned qy = std::min(gy / fine.k, grid.ny - 2);
+                    const unsigned qz = std::min(gz / fine.k, grid.nz - 2);
+                    std::size_t corner[8];
+                    for (int n = 0; n < 8; ++n)
+                    {
+                        corner[n] = grid.index(qx + (n & 1), qy + ((n >> 1) & 1),
+                                               qz + ((n >> 2) & 1));
+                    }
+
+                    // Shell.
+                    double low = std::numeric_limits<double>::infinity();
+                    double high = -std::numeric_limits<double>::infinity();
+                    double closest = std::numeric_limits<double>::infinity();
+                    for (const std::size_t n : corner)
+                    {
+                        low = std::min(low, c.shell_field[n]);
+                        high = std::max(high, c.shell_field[n]);
+                        closest = std::min(closest, std::abs(c.shell_field[n]));
+                    }
+                    double shell;
+                    if (c.options.fine_exact || closest <= near || (low < 0.0 && high > 0.0))
+                    {
+                        const double d = helmet_mesh(p);
+                        shell = band ? std::abs(d) - c.shell_thickness * 0.5 : d - c.wall_skin;
+                        ++local_shell;
+                    }
+                    else
+                    {
+                        shell = low > 0.0 ? low - diagonal : high + diagonal;
+                    }
+
+                    // Liner and lattice exist only in covered directions.
+                    double value;
+                    if (!c.cavity.covers(p))
+                    {
+                        value = std::min(shell, c.cavity.open_distance);
+                    }
+                    else
+                    {
+                        const double inside = c.cavity.radial_distance(p, c.cavity_margin);
+                        double smallest = std::numeric_limits<double>::infinity();
+                        bool all_computed = true;
+                        for (const std::size_t n : corner)
+                        {
+                            smallest = std::min(smallest, c.swept[n]);
+                            all_computed = all_computed && c.swept_computed[n];
+                        }
+                        double swept;
+                        if (c.options.fine_exact || !all_computed ||
+                            smallest <= liner_outer + swept_near)
+                        {
+                            swept = swept_head_distance_at(
+                                coarse_head, c.lift.direction, sweep_box_min, sweep_box_max,
+                                sweep_margin, fine.spacing, p, head_mesh(p));
+                            ++local_swept;
+                        }
+                        else
+                        {
+                            // A lower bound (the coarse sweep overestimates by at
+                            // most a quarter cell), at least v beyond the liner.
+                            swept = smallest - swept_reach;
+                        }
+                        const double inner_liner =
+                            std::abs(swept - c.liner_center_distance) - c.liner_thickness * 0.5;
+                        const double clipped_lattice =
+                            std::max({lattice[local], inside, -swept + c.head_clearance});
+                        if (clipped_lattice < 0.0)
+                        {
+                            ++local_lattice;
+                        }
+                        value = std::min({shell, inner_liner, clipped_lattice});
+                    }
+                    values[local] = value;
+                }
+            }
+        }
+        exact_shell += local_shell;
+        exact_swept += local_swept;
+        lattice_points += local_lattice;
+    };
+
+    const double isovalue = fine.spacing * 0.05;
+    MeshStatistics statistics;
+    if (!mesh_blocks(fine, blocks, field, isovalue, output.vertices, output.faces,
+                     statistics, error))
+    {
+        return false;
+    }
+    const double seconds =
+        std::chrono::duration<double>(clock::now() - start).count();
+    // Counted per block: a sample on a face between blocks counts in each.
+    std::cout << "  block samples (shared faces counted per block): " << statistics.samples
+              << "; exact distances: shell at " << exact_shell.load() << ", swept head at "
+              << exact_swept.load() << "; lattice material at " << lattice_points.load()
+              << "; " << output.faces.rows() << " triangles; "
+              << fixed1(seconds) << " s.\n";
+    if (lattice_points.load() == 0)
+    {
+        error = "No lattice fits between the fitted head and helmet at this "
+                "voxel resolution. Adjust the fit or gap and try again.";
+        return false;
+    }
+    if (statistics.negative_samples == 0 || statistics.negative_samples == statistics.samples)
+    {
+        error = "The generated implicit solid does not intersect the sampling grid.";
+        return false;
+    }
+    if (output.vertices.rows() == 0 || output.faces.rows() == 0 ||
+        !output.vertices.allFinite())
+    {
+        error = "Marching tetrahedra did not produce a valid output mesh.";
+        return false;
+    }
+    output.voxel_size = fine.spacing;
+
+    std::size_t boundary_edges = 0;
+    std::size_t nonmanifold_edges = 0;
+    std::size_t boundary_grid_edges = 0;
+    const Eigen::RowVector3d fine_last = fine.point(fine.nx - 1, fine.ny - 1, fine.nz - 1);
+    if (!closed_two_manifold(
+            output.faces, output.vertices, fine.minimum, fine_last, fine.spacing,
+            boundary_edges, nonmanifold_edges, boundary_grid_edges))
+    {
+        error = "The fine output is not a closed two-manifold mesh; found " +
+            std::to_string(boundary_edges) + " boundary edges and " +
+            std::to_string(nonmanifold_edges) + " non-manifold edges (" +
+            std::to_string(boundary_grid_edges) + " at grid bounds). A surface "
+            "reaching a skipped block shows up here.";
+        return false;
+    }
+    return true;
+}
+
 } // namespace
 
 bool generate_final_helmet(
@@ -548,10 +530,18 @@ bool generate_final_helmet(
     LatticeType lattice_type,
     GeneratedMesh& output,
     std::string& error,
-    double lattice_room_target,
-    ShellMode shell_mode,
-    double wall_skin_cells)
+    const GenerationOptions& options)
 {
+    const double lattice_room_target = options.lattice_room_target;
+    const ShellMode shell_mode = options.shell_mode;
+    const double wall_skin_cells = options.wall_skin_cells;
+    const bool fine = options.fine_spacing > 0.0;
+    if (!std::isfinite(options.fine_spacing) || options.fine_spacing < 0.0 ||
+        options.fine_block_cells < 1 || options.fine_block_cells > 64)
+    {
+        error = "Invalid fine-grid options.";
+        return false;
+    }
     if (head_vertices.rows() == 0 || head_faces.rows() == 0 ||
         helmet_vertices.rows() == 0 || helmet_faces.rows() == 0 ||
         head_vertices.cols() != 3 || helmet_vertices.cols() != 3 ||
@@ -617,6 +607,32 @@ bool generate_final_helmet(
     }
     output.voxel_size = voxel_size;
     grid.minimum += voxel_size * Eigen::RowVector3d(0.173205, 0.223607, 0.316228);
+    const Eigen::RowVector3d grid_last =
+        grid.minimum + grid.step.cwiseProduct(Eigen::RowVector3d(
+            grid.nx - 1, grid.ny - 1, grid.nz - 1));
+
+    // The grid the surface is taken from: the coarse grid itself, or a fine
+    // grid over it (coarse spacing / k, same origin) sampled only in blocks
+    // the helmet layer passes through.
+    FineGrid surface_grid;
+    if (fine)
+    {
+        if (!make_fine_grid(grid.minimum, voxel_size, grid.nx, grid.ny, grid.nz,
+                            options.fine_spacing, surface_grid, error))
+        {
+            return false;
+        }
+    }
+    else
+    {
+        surface_grid.minimum = grid.minimum;
+        surface_grid.spacing = voxel_size;
+        surface_grid.nx = grid.nx;
+        surface_grid.ny = grid.ny;
+        surface_grid.nz = grid.nz;
+        surface_grid.k = 1;
+    }
+    const double surface_spacing = surface_grid.spacing;
 
     std::cout << "Generating "
               << (lattice_type == LatticeType::Auxetic ? "auxetic" : "gyroid TPMS")
@@ -739,7 +755,9 @@ bool generate_final_helmet(
     // the stock wall's inner face (what it takes from the room for lattice).
     //   Band: within half a skin thickness of any face (the original).
     //   Wall: inside the wall, plus the skin on every face.
-    const double wall_skin = wall_skin_cells * voxel_size;
+    // Skin in cells of the grid the surface is taken from: it only has to keep
+    // walls thicker than that grid can resolve, so it shrinks with a finer grid.
+    const double wall_skin = wall_skin_cells * surface_spacing;
     const double shell_inward =
         shell_mode == ShellMode::Band ? shell_thickness * 0.5 : wall_skin;
     std::vector<double> shell_field(grid.sample_count());
@@ -804,6 +822,48 @@ bool generate_final_helmet(
         const Eigen::RowVector3d p = grid_point(grid, index);
         inside_helmet[index] = cavity.radial_distance(p, cavity_margin);
         covered[index] = cavity.covers(p) ? 1 : 0;
+    }
+    // Fine mode: covered directions grown by one coarse sample (26 neighbours),
+    // so the coarse sweep and the block selection reach every fine sample in a
+    // covered direction even where the covered region is narrower than a cell.
+    std::vector<char> covered_near;
+    if (fine)
+    {
+        covered_near.assign(grid.sample_count(), 0);
+        for (unsigned z = 0; z < grid.nz; ++z)
+        {
+            for (unsigned y = 0; y < grid.ny; ++y)
+            {
+                for (unsigned x = 0; x < grid.nx; ++x)
+                {
+                    if (!covered[grid.index(x, y, z)])
+                    {
+                        continue;
+                    }
+                    for (int dz = -1; dz <= 1; ++dz)
+                    {
+                        for (int dy = -1; dy <= 1; ++dy)
+                        {
+                            for (int dx = -1; dx <= 1; ++dx)
+                            {
+                                const long nx = static_cast<long>(x) + dx;
+                                const long ny = static_cast<long>(y) + dy;
+                                const long nz = static_cast<long>(z) + dz;
+                                if (nx >= 0 && ny >= 0 && nz >= 0 &&
+                                    nx < static_cast<long>(grid.nx) &&
+                                    ny < static_cast<long>(grid.ny) &&
+                                    nz < static_cast<long>(grid.nz))
+                                {
+                                    covered_near[grid.index(
+                                        static_cast<unsigned>(nx), static_cast<unsigned>(ny),
+                                        static_cast<unsigned>(nz))] = 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // Getting it on. The helmet must slide off the head (and, reversed, on)
@@ -899,14 +959,12 @@ bool generate_final_helmet(
     // where no liner belongs and the skin covers any overlap.
     std::vector<double> swept(
         head_distance.data(), head_distance.data() + head_distance.size());
+    std::vector<char> swept_computed;   // 1 where the sweep was followed (accurate)
     {
         // Followed within the head's bounds widened by `margin`: further out
         // the head is at least that far, and liner and lattice only use values
         // up to liner_center_distance + liner_thickness / 2 (3 voxels).
         const double margin = 7.0 * voxel_size;
-        const Eigen::RowVector3d grid_last =
-            grid.minimum + grid.step.cwiseProduct(Eigen::RowVector3d(
-                grid.nx - 1, grid.ny - 1, grid.nz - 1));
         const Eigen::RowVector3d box_min = head_min.array() - margin;
         const Eigen::RowVector3d box_max = head_max.array() + margin;
         if (liner_center_distance + liner_thickness * 0.5 + voxel_size > margin ||
@@ -920,7 +978,8 @@ bool generate_final_helmet(
         for (std::size_t index = 0; index < grid.sample_count(); ++index)
         {
             if (inside_helmet[index] < 2.0 * voxel_size ||
-                (covered[index] && head_distance[index] < margin))
+                (covered[index] && head_distance[index] < margin) ||
+                (fine && covered_near[index]))
             {
                 near_cavity.push_back(index);
             }
@@ -934,6 +993,11 @@ bool generate_final_helmet(
         field.values = head_distance.data();
         swept_head_distance(
             field, lift.direction, box_min, box_max, margin, near_cavity, swept);
+        swept_computed.assign(grid.sample_count(), 0);
+        for (const std::size_t index : near_cavity)
+        {
+            swept_computed[index] = 1;
+        }
     }
 
     double maximum_gap_half_width = 0.0;   // measured along rays: >= the true half-width
@@ -976,17 +1040,48 @@ bool generate_final_helmet(
               << maximum_gap_half_width << " (model units).\n"
               << "Lattice unit-cell pitch: " << output.cell_size
               << " (anchored to the combined model bounds).\n";
+    if (fine)
+    {
+        const FineContext context{
+            grid, surface_grid, options, head_vertices, head_faces, helmet_vertices,
+            helmet_faces, cavity, lift, head_distance, shell_field, swept, swept_computed,
+            inside_helmet, covered_near, head_min, head_max, grid_last, lattice_type,
+            output.cell_size, lattice_anchor, shell_thickness, wall_skin,
+            liner_center_distance, liner_thickness, head_clearance, cavity_margin};
+        return generate_fine_surface(context, output, error);
+    }
+
     std::vector<float> lattice_distance(
         grid.sample_count(), std::numeric_limits<float>::infinity());
     if (lattice_type == LatticeType::Auxetic)
     {
-        build_auxetic_field(
-            grid, output.cell_size, lattice_anchor, lattice_distance);
+        // Padded by the radius only, exactly as the original rasterizer.
+        const double radius = auxetic_strut_radius(output.cell_size);
+        SampleBox box;
+        box.origin = grid.minimum;
+        box.spacing = voxel_size;
+        box.count[0] = grid.nx;
+        box.count[1] = grid.ny;
+        box.count[2] = grid.nz;
+        for (const Strut& strut :
+             auxetic_struts(grid.minimum, grid_last, output.cell_size, lattice_anchor))
+        {
+            rasterize_strut<float>(box, strut, radius, radius, lattice_distance);
+        }
     }
     else
     {
-        build_gyroid_field(
-            grid, output.cell_size, lattice_anchor, lattice_distance);
+        for (unsigned z = 0; z < grid.nz; ++z)
+        {
+            for (unsigned y = 0; y < grid.ny; ++y)
+            {
+                for (unsigned x = 0; x < grid.nx; ++x)
+                {
+                    lattice_distance[grid.index(x, y, z)] = static_cast<float>(
+                        gyroid_distance(grid.point(x, y, z), output.cell_size, lattice_anchor));
+                }
+            }
+        }
     }
 
     Eigen::VectorXd final_distance(grid.sample_count());
@@ -1030,8 +1125,18 @@ bool generate_final_helmet(
     }
 
     const double isovalue = voxel_size * 0.05;
-    marching_tetrahedra(
-        grid, final_distance, isovalue, output.vertices, output.faces);
+    MeshStatistics statistics;
+    if (!mesh_blocks(
+            surface_grid, {whole_grid_block(surface_grid)},
+            [&](const FineBlock&, std::vector<double>& values)
+            {
+                std::copy(final_distance.data(),
+                          final_distance.data() + final_distance.size(), values.begin());
+            },
+            isovalue, output.vertices, output.faces, statistics, error))
+    {
+        return false;
+    }
     if (output.vertices.rows() == 0 || output.faces.rows() == 0 ||
         !output.vertices.allFinite())
     {
@@ -1045,7 +1150,7 @@ bool generate_final_helmet(
     const Eigen::RowVector3d grid_max =
         grid.minimum + grid.step.cwiseProduct(Eigen::RowVector3d(
             grid.nx - 1, grid.ny - 1, grid.nz - 1));
-    if (!has_closed_two_manifold_edges(
+    if (!closed_two_manifold(
             output.faces, output.vertices, grid.minimum, grid_max, voxel_size,
             boundary_edges, nonmanifold_edges, boundary_grid_edges))
     {

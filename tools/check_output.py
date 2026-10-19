@@ -234,12 +234,23 @@ def describe(tilt, side):
     return "up, tilted " + " and ".join(parts)
 
 
-def generator_reservation(Vh, Vm, shell="wall", skin_cells=0.5):
+def surface_spacing(v, fine_spacing):
+    """The grid the generator takes the surface from: the coarse grid, or with
+    --fine-spacing the coarse spacing / k, k the smallest integer giving a
+    spacing <= the request (fine_grid.cpp make_fine_grid)."""
+    if not fine_spacing or fine_spacing <= 0:
+        return v
+    return v / max(1.0, np.ceil(v / fine_spacing * (1.0 - 1e-12)))
+
+
+def generator_reservation(Vh, Vm, shell="wall", skin_cells=0.5, fine_spacing=0.0):
     """lattice_generator.cpp's grid spacing for this head and helmet, and what it
     reserves between the head and the lattice: clearance (1 voxel) + liner
     (max(2 voxels, 0.5% of head height)) + the shell's inward part (band: half
-    the skin, max(2.25 voxels, 1%)/2; wall: the skin, skin_cells voxels).
-    The grid coarsens as the helmet grows (4M-sample cap), so this is per fit."""
+    the skin, max(2.25 voxels, 1%)/2; wall: the skin, skin_cells cells of the
+    surface grid, which is the fine grid with --fine-spacing).
+    The grid coarsens as the helmet grows (4M-sample cap), so this is per fit.
+    Returns (coarse spacing, reserved, surface spacing)."""
     H = np.ptp(Vh[:, 1])
     cmin, cmax = np.minimum(Vh.min(0), Vm.min(0)), np.maximum(Vh.max(0), Vm.max(0))
     v = H / 120.0
@@ -250,8 +261,9 @@ def generator_reservation(Vh, Vm, shell="wall", skin_cells=0.5):
 
     while count(v) > 4_000_000:
         v *= np.cbrt(count(v) / 4_000_000) * 1.01
-    inward = max(2.25 * v, 0.01 * H) / 2 if shell == "band" else skin_cells * v
-    return v, v + max(2.0 * v, 0.005 * H) + inward
+    vs = surface_spacing(v, fine_spacing)
+    inward = max(2.25 * v, 0.01 * H) / 2 if shell == "band" else skin_cells * vs
+    return v, v + max(2.0 * v, 0.005 * H) + inward, vs
 
 
 def zoom_fit(stock_vertices, Vh, gap=0.005):
@@ -282,7 +294,7 @@ def step3(T, lid, centre, helm, S_helm, R, U, step, args, in_way_skin):
     and the step-3 decision gate (agreed 2026-10-15, see DECISIONS.md)."""
     Vh = T.reshape(-1, 3)
     Vm = np.asarray(helm.vertices)
-    voxel, reserved = generator_reservation(Vh, Vm, args.shell, args.shell_skin)
+    voxel, reserved, _ = generator_reservation(Vh, Vm, args.shell, args.shell_skin, args.fine_spacing)
     nt, nph, _, TT, D = direction_map(0.5)
     w = np.sin(TT)
     el = 90 - np.degrees(TT)
@@ -381,7 +393,7 @@ def step3(T, lid, centre, helm, S_helm, R, U, step, args, in_way_skin):
     return verdict
 
 
-def shell_checks(S_out, S_helm, centre, R, vents, H, v, args):
+def shell_checks(S_out, S_helm, centre, R, vents, H, v, vs, args):
     """Is the shell there and where it should be? Over the directions the helmet
     covers, away from vents and edges (one map cell in from them):
       continuity  a ray from far outside, aimed at the head centre, must first
@@ -410,8 +422,8 @@ def shell_checks(S_out, S_helm, centre, R, vents, H, v, args):
     t_out = S_out.cast_rays(tensor(np.hstack([origin, -d])))["t_hit"].numpy().astype(float)
     ok = np.isfinite(t_helm)
     standoff = t_helm[ok] - t_out[ok]                # > 0: output stands outside the stock face
-    # v: the generator's actual grid spacing for this fit
-    expected = (max(2.25 * v, 0.01 * H) / 2) if args.shell == "band" else args.shell_skin * v
+    # v: the generator's coarse grid spacing for this fit; vs: the surface grid's
+    expected = (max(2.25 * v, 0.01 * H) / 2) if args.shell == "band" else args.shell_skin * vs
     deep = ~np.isfinite(standoff) | (standoff < -1.0 * v)   # met nothing, or met it well inside the stock face
     wd = w[good][ok]
     # middle of the stock wall along rays from the centre
@@ -450,6 +462,8 @@ def main():
     ap.add_argument("--shell", choices=("wall", "band"), default="wall",
                     help="the generator's --shell (default wall), for the step-3 allowance and the shell checks")
     ap.add_argument("--shell-skin", type=float, default=0.5, help="the generator's --shell-skin, grid cells")
+    ap.add_argument("--fine-spacing", type=float, default=0.0,
+                    help="the generator's --fine-spacing (0 = off), for the wall skin in the allowance and shell checks")
     ap.add_argument("--density", type=float, default=1.0, help="g/cm^3 for the mass estimate (printed nylon ~0.95-1.0)")
     args = ap.parse_args()
 
@@ -557,8 +571,9 @@ def main():
         amount = f"{vol(touching)*1e6:.2f} cm^3" if H < 2 else f"{vol(touching):.3g} {unit}"
         print(f"   note: shell within the head clearance (fit too tight there, not judged): {amount}")
 
-    v_generator, _ = generator_reservation(Th.reshape(-1, 3), np.asarray(helm.vertices), args.shell, args.shell_skin)
-    v3b = shell_checks(S_out, S_helm, centre, R, vents, H, v_generator, args)
+    v_generator, _, v_surface = generator_reservation(Th.reshape(-1, 3), np.asarray(helm.vertices),
+                                                      args.shell, args.shell_skin, args.fine_spacing)
+    v3b = shell_checks(S_out, S_helm, centre, R, vents, H, v_generator, v_surface, args)
     v3 = None
     if args.step3:
         v3 = step3(Th, lid, centre, helm, S_helm, R, U if lid is not None else np.zeros_like(np.isfinite(R)),
