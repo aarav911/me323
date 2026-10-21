@@ -255,7 +255,30 @@ bool make_reentrant_cell(
             "h/l or a less steep angle.";
         return false;
     }
+    // The largest opening: the largest distance from the wall surfaces over
+    // one repeat (the pattern repeats every 2 dx and 2 dz), sampled, plus the
+    // sampling step so the result is an upper bound.
+    {
+        const double step = std::min(cell.dx, cell.dz) / 100.0;
+        const double reach = cell.width + cell.h + 2.0 * cell.dz;
+        double largest = 0.0;
+        for (double x = 0.5 * step; x < 2.0 * cell.dx; x += step)
+        {
+            for (double z = 0.5 * step; z < 2.0 * cell.dz; z += step)
+            {
+                largest = std::max(largest, reentrant_wall_distance(
+                    Eigen::RowVector3d(x, 0.0, z), cell, Eigen::RowVector3d::Zero(), reach));
+            }
+        }
+        cell.largest_opening = largest + step;
+    }
     return true;
+}
+
+double roof_chamfer(double wall, double roof, double angle_degrees, double reach)
+{
+    const double angle = angle_degrees * pi / 180.0;
+    return wall * std::sin(angle) + roof * std::cos(angle) - reach * std::sin(angle);
 }
 
 void reentrant_ideal_poisson(const ReentrantCell& cell, double& nu_x, double& nu_z)

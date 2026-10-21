@@ -65,8 +65,13 @@ struct GenerationOptions
     double wall_thickness = 0.0012;
     double line_width = 0.0004;          // FDM line width: warn if the wall is not whole lines; 0 = no check
     // Simplify the mesh to within this distance (model units, mesh_simplify.h);
-    // 0 = leave it as extracted.
+    // 0 = leave it as extracted. > 0 is printable mode: the mesh is also kept
+    // safe for a 32-bit STL and loose fragments are removed (mesh_components.h).
     double simplify_tolerance = 0.0;
+    // Re-entrant cell only: chamfer the walls up to the liner at this angle
+    // from horizontal (45-80), so that, printed crown-down, the liner rests on
+    // slopes instead of bridging the cells; 0 = none (lattice_struts.h).
+    double roof_chamfer_degrees = 0.0;
 };
 
 bool generate_final_helmet(

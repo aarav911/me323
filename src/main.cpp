@@ -10,15 +10,26 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <string>
 
+#include "coupon.h"
 #include "fit_config.h"
 #include "head_lid.h"
 #include "helmet_fit.h"
 #include "lattice_generator.h"
+#include "print_export.h"
+
+// A number with a fixed count of decimals, for messages.
+std::string fixed_text(double value, int decimals)
+{
+    char text[64];
+    std::snprintf(text, sizeof text, "%.*f", decimals, value);
+    return text;
+}
 
 struct BoundingBox
 {
@@ -163,25 +174,29 @@ void fit_meshes(
 
 int main(int argc, char** argv)
 {
-    LatticeType startup_lattice = LatticeType::Gyroid;
+    // Defaults (2026-10-21): the printable re-entrant helmet. --classic gives
+    // back the original behaviour (Aarav's cell, coarse grid, no simplification).
+    LatticeType startup_lattice = LatticeType::Auxetic;
     bool generate_only = false;
     bool export_fit = false;
     std::string fit_override;          // "", "zoom" or "stretch"
     double lattice_room_target = 0.0;  // model units; 0 = no target in the report
     ShellMode shell_mode = ShellMode::Wall;
     double wall_skin_cells = 0.5;
-    double fine_spacing = 0.0;         // model units; 0 = surface from the coarse grid
+    double fine_spacing = 0.0004;      // model units; 0 = surface from the coarse grid
     bool fine_exact = false;           // tests: exact distances at every fine sample
     bool fine_all_blocks = false;      // tests: evaluate every block, skip none
     unsigned fine_block_cells = 8;     // tests: block size in coarse cells
     GenerationOptions cell_defaults;   // step 4b: the re-entrant cell and simplification
-    AuxeticCell auxetic_cell = cell_defaults.auxetic_cell;
+    AuxeticCell auxetic_cell = AuxeticCell::Reentrant;
     double cell_width = cell_defaults.cell_width;
     double cell_angle = cell_defaults.cell_angle_degrees;
     double cell_h_ratio = cell_defaults.cell_h_ratio;
     double wall_thickness = cell_defaults.wall_thickness;
     double line_width = cell_defaults.line_width;
-    double simplify_tolerance = cell_defaults.simplify_tolerance;
+    double simplify_tolerance = 0.00005;   // model units (0.05 mm); 0 = not printable mode
+    double roof_chamfer = 0.0;             // degrees; 0 = none
+    bool coupon = false;                   // write the two print-test coupons and stop
     // A number from argv[argument], or false (and a message) if it is not one
     // or fails the check.
     const auto read_number = [&](int at, double& value, bool (*ok)(double), const char* what)
@@ -341,6 +356,26 @@ int main(int argc, char** argv)
                 return 2;
             }
         }
+        else if (option == "--classic")
+        {
+            // The original behaviour; flags after this one still apply.
+            auxetic_cell = AuxeticCell::Original;
+            fine_spacing = 0.0;
+            simplify_tolerance = 0.0;
+        }
+        else if (option == "--roof-chamfer" && argument + 1 < argc)
+        {
+            if (!read_number(++argument, roof_chamfer,
+                             [](double v) { return v == 0.0 || (v >= 45.0 && v <= 80.0); },
+                             "--roof-chamfer needs 0 (none) or 45-80 degrees from horizontal."))
+            {
+                return 2;
+            }
+        }
+        else if (option == "--coupon")
+        {
+            coupon = true;
+        }
         else if (option == "--fine-exact")
         {
             fine_exact = true;
@@ -388,10 +423,73 @@ int main(int argc, char** argv)
                          " [--cell-angle <deg>] [--cell-h-ratio <h/l>]\n"
                          "       [--wall-thickness <size>] [--line-width <size>]"
                          " [--simplify <tolerance>]\n"
+                         "       [--roof-chamfer <deg>] [--classic] [--coupon]\n"
                          "       test options: [--fine-exact] [--fine-all-blocks]"
                          " [--fine-block-cells <n>]\n";
             return 2;
         }
+    }
+
+    // --coupon: the two print-test coupons (no head or helmet needed). The
+    // cell flags are in the head file's units, metres for our scan; the
+    // coupons are made in millimetres.
+    if (coupon)
+    {
+        if (auxetic_cell != AuxeticCell::Reentrant)
+        {
+            std::cerr << "--coupon tests the re-entrant cell; drop --cell original / --classic.\n";
+            return 2;
+        }
+        std::string error;
+        ReentrantCell cell_mm;
+        if (!make_reentrant_cell(1000.0 * cell_width, cell_angle, cell_h_ratio, 1000.0 * wall_thickness,
+                                 cell_mm, error))
+        {
+            std::cerr << "Coupon: " << error << '\n';
+            return 1;
+        }
+        if (cell_mm.width < 2.0 || cell_mm.width > 50.0)
+        {
+            std::cerr << "Coupon: a cell " << cell_mm.width << " mm wide; the cell sizes are taken "
+                         "to be in metres (e.g. --cell-width 0.010).\n";
+            return 1;
+        }
+        CouponSpec spec;
+        spec.spacing = 1000.0 * (fine_spacing > 0.0 ? fine_spacing : 0.0004);
+        spec.simplify_tolerance = 1000.0 * (simplify_tolerance > 0.0 ? simplify_tolerance : 0.00005);
+        const double chamfer_b = roof_chamfer > 0.0 ? roof_chamfer : 55.0;
+        for (const double chamfer : {0.0, chamfer_b})
+        {
+            spec.roof_chamfer_degrees = chamfer;
+            const std::string name = chamfer > 0.0 ? "coupon_B_chamfer.stl" : "coupon_A_no_chamfer.stl";
+            Eigen::MatrixXd V;
+            Eigen::MatrixXi F;
+            CouponReport report;
+            if (!generate_coupon(cell_mm, spec, V, F, report, error))
+            {
+                std::cerr << name << ": " << error << '\n';
+                return 1;
+            }
+            if (!igl::writeSTL(name, V, F, igl::FileEncoding::Binary))
+            {
+                std::cerr << "Could not write " << name << ".\n";
+                return 1;
+            }
+            std::cout << name << ": " << spec.width << " x " << spec.depth << " x " << report.height
+                      << " mm (floor " << spec.floor << ", walls " << spec.walls_height << ", roof "
+                      << spec.roof << ", sides " << spec.side << "), walls " << cell_mm.wall_thickness
+                      << " mm, grid " << spec.spacing << " mm; "
+                      << (chamfer > 0.0 ? "roof on " + fixed_text(chamfer, 0) + " deg slopes reaching " +
+                                              fixed_text(report.chamfer_reach, 2) + " mm from the walls"
+                                        : std::string("roof bridging the cells"))
+                      << "; " << F.rows() << " triangles, " << report.fragments.pockets
+                      << " sealed cells, " << report.fragments.removed << " fragments removed"
+                      << (report.fragments.large_extra > 0 ? ", WARNING: separate pieces" : "") << ".\n";
+        }
+        std::cout << "Print both in TPU (walls vertical, as written). If coupon A's roof is flat and "
+                     "solid, print the helmet as it is; if it sags, regenerate the helmet with "
+                     "--roof-chamfer " << chamfer_b << ".\n";
+        return 0;
     }
 
     // Desired clearance uses the same units as the head STL (e.g. 0.005
@@ -615,6 +713,7 @@ int main(int argc, char** argv)
         options.wall_thickness = wall_thickness;
         options.line_width = line_width;
         options.simplify_tolerance = simplify_tolerance;
+        options.roof_chamfer_degrees = roof_chamfer;
         if (!generate_final_helmet(
                 fitted_head, F_head, head_lid.faces, fitted_helmet, F_helmet,
                 type, generated, error, options))
@@ -635,6 +734,27 @@ int main(int argc, char** argv)
             config_status = "Could not write " + filename + ".";
             std::cerr << config_status << '\n';
             return false;
+        }
+        // Printable mode: also the copy a slicer wants (mm, Z up, crown-down,
+        // on the bed). The viewer keeps showing the model as fitted.
+        if (simplify_tolerance > 0.0)
+        {
+            const double head_height =
+                fitted_head.col(1).maxCoeff() - fitted_head.col(1).minCoeff();
+            Eigen::MatrixXd print_vertices;
+            PrintPlacement placement;
+            make_print_copy(generated.vertices, head_height, print_vertices, placement);
+            const std::string print_name = filename.substr(0, filename.size() - 4) + "_print.stl";
+            if (!igl::writeSTL(print_name, print_vertices, generated.faces, igl::FileEncoding::Binary))
+            {
+                config_status = "Could not write " + print_name + ".";
+                std::cerr << config_status << '\n';
+                return false;
+            }
+            std::cout << "Wrote " << print_name << " for printing: x" << placement.scale
+                      << " (to mm), crown-down (turned about X), on the bed: "
+                      << placement.size.x() << " x " << placement.size.y() << " x "
+                      << placement.size.z() << " mm.\n";
         }
 
         if (final_mesh_index != 0)

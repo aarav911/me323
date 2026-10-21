@@ -675,9 +675,13 @@ cubes extracts the result and the app writes `final_helmet_auxetic.stl` or
 generated when the app starts; either case can be regenerated from the
 viewer. The generated STL is shown in the viewer.
 
-Run `./build/me323` for the default TPMS case, or
-`./build/me323 --lattice auxetic` to generate and open the auxetic case
-on startup. Add `--generate-only` to export the selected case and exit without
+Run `./build/me323` to generate the printable helmet and open it (the
+defaults since step 4: the re-entrant honeycomb walls on a 0.37 mm grid,
+simplified to 0.05 mm, about 11 minutes for our scan), or
+`./build/me323 --lattice tpms` for the gyroid case. `--classic` gives back the
+original behaviour in one flag (Aarav's cell, the coarse grid, no
+simplification; flags after it still apply), e.g.
+`./build/me323 --classic --lattice auxetic`. Add `--generate-only` to export the selected case and exit without
 opening a viewer (useful for batch runs or automated checks). Add
 `--export-fit` to also write `fitted_head.stl` and `fitted_helmet.stl`, the
 exact meshes the generator received (the head keeps its lid marker).
@@ -705,17 +709,40 @@ of extrusion lines). It needs `--fine-spacing` (the walls are thinner than the
 coarse grid); the program refuses a cell whose walls would nearly touch, a grid
 too coarse for the walls, and sizes that look like the wrong units. Check a cell
 first with `analysis_tools/poisson_frame.py --cell-width 10 --cell-angle -35
---wall-thickness 1.2` (mm): Poisson's ratio both ways, stiffness, gap. The default
-`--cell original` is the original lattice, unchanged.
+--wall-thickness 1.2` (mm): Poisson's ratio both ways, stiffness, gap. It is the
+default (`--cell original` gives the original lattice, unchanged); it applies to
+the auxetic lattice only (the gyroid ignores it). The pattern is anchored on the
+head's centre, so it is mirror-symmetric left to right.
+
+`--roof-chamfer <deg>` (0 = none, default; else 45-80) puts slopes under the
+liner from every wall, so that printed crown-down the liner rests on them
+instead of bridging the cells (about 4.4 mm wide). Use it if the TPU test
+coupon shows the roof sagging (below).
 
 `--simplify <tolerance>` (e.g. 0.00005 = 0.05 mm) makes a printable mesh: each
 block is simplified as soon as it is meshed, with a guaranteed bound (every
 original point within the tolerance of the result and every new vertex within it
 of the original), no self-intersections, the blocks still matching exactly, and
 no two vertices close enough to merge in the 32-bit STL. For the Run_2 stretch fit,
-`--fine-spacing 0.0004 --cell reentrant --simplify 0.00005` gives 5.9 M triangles
-(a 293 MB STL; unsimplified it would be about 119 M) in about 11 minutes with 2.2 GB
-of memory.
+`--fine-spacing 0.0004 --cell reentrant --simplify 0.00005` (the defaults) gives
+5.9 M triangles (a 293 MB STL; unsimplified it would be about 119 M) in about 11
+minutes with 2.2 GB of memory. Printable mode also removes loose fragments (keeps
+the main body, its sealed air pockets, and any larger separate piece, with a
+warning) and writes a second file for the printer, `final_helmet_<case>_print.stl`:
+in millimetres, turned crown-down (a proper rotation, not a mirror), on the bed.
+
+Printing (FDM, TPU): load `*_print.stl` as it is (crown on the bed, walls
+vertical). Supports **on the build plate only**: the honeycomb cells are sealed,
+and support inside them could never be removed; outside, the shell's overhangs
+are reachable from the plate. Add a brim (the crown is a small contact). With a
+0.4 mm nozzle the 1.2 mm walls are 3 lines.
+
+Test coupon first: `./build/me323 --coupon` writes `coupon_A_no_chamfer.stl` and
+`coupon_B_chamfer.stl` (40 x 40 x 32.7 mm, mm, ready to print; no head needed):
+the helmet's walls between a floor and a liner-like roof, closed at the sides.
+Print both in TPU. If A's roof is flat and solid, print the helmet as it is; if
+it sags into the cells, regenerate the helmet with `--roof-chamfer 55` (B's roof
+needs no bridging).
 
 `tools/check_output.py` independently checks an output (Python with numpy,
 scipy, open3d; matplotlib for `--png`), with Open3D rather than libigl. It sorts

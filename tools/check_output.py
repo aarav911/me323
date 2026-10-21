@@ -409,12 +409,14 @@ def overhang_report(mesh, S_head, S_helm, centre, skin_tol, liner_tol, angle, H)
     build -Y). A face overhangs if it leans more than `angle` past vertical,
     i.e. its outward normal points down by more than `angle` below the
     horizontal (n . down > sin angle). Faces within 1 mm of the bed are not
-    counted (they sit on it). Split by
-    surface (centroid nearest to the shell: skin; to the head: liner; else
-    lattice), and for skin and liner by side (normal toward the head centre or
-    away), so the overhangs inside the part (the roof closing the lattice) show
-    apart from those outside it (supportable). Up to 1M triangles, sampled by
-    area, are classified."""
+    counted (they sit on it). Split by surface (centroid nearest to the shell:
+    skin; to the head: liner; else lattice), and for skin and liner by side
+    (normal toward the head centre or away), so the overhangs inside the part
+    (the roof closing the lattice) show apart from those outside it
+    (supportable). Exact: every face counts; only the downward-facing ones
+    (in either direction) are classified, which needs no sampling. (A sampled
+    version used up to 2026-10-21 overestimated: weighted sampling without
+    replacement is biased.)"""
     V = np.asarray(mesh.vertices)
     F = np.asarray(mesh.triangles)
     T = V[F]
@@ -423,33 +425,36 @@ def overhang_report(mesh, S_head, S_helm, centre, skin_tol, liner_tol, angle, H)
     if exact_volume(mesh) < 0:
         N = -N
     good = area > 0
-    rng = np.random.default_rng(11)
-    idx = np.where(good)[0]
-    if len(idx) > 1_000_000:
-        idx = np.sort(rng.choice(idx, 1_000_000, replace=False, p=area[idx] / area[idx].sum()))
-        weight = np.full(len(idx), area[good].sum() / len(idx))
-    else:
-        weight = area[idx]
-    n = N[idx] / np.linalg.norm(N[idx], axis=1)[:, None]
-    c = T[idx].mean(axis=1)
-    d_skin = S_helm.compute_distance(tensor(c)).numpy()
-    d_head = np.abs(signed_distance(S_head, c))
-    toward = np.einsum("ij,ij->i", n, centre - c) > 0          # normal points toward the head centre
-    is_skin = d_skin <= skin_tol
-    is_liner = ~is_skin & (d_head <= liner_tol)
-    classes = [("shell, outer face", is_skin & ~toward), ("shell, inner face (roof over the lattice)", is_skin & toward),
-               ("liner, head side", is_liner & toward), ("liner, lattice side (roof)", is_liner & ~toward),
-               ("lattice walls", ~is_skin & ~is_liner)]
-    cos_limit = np.cos(np.radians(90.0 - angle))
-    unit = "cm^2" if H < 2.0 else "units^2"
+    n = np.zeros_like(N)
+    n[good] = N[good] / np.linalg.norm(N[good], axis=1)[:, None]
+    c = T.mean(axis=1)
+    limit = np.sin(np.radians(angle))
+    bed_tol = 0.001 if H < 2.0 else 1.0
+    directions = (("crown-up (rim on the bed)", np.array([0.0, 1.0, 0.0])),
+                  ("crown-down (crown on the bed)", np.array([0.0, -1.0, 0.0])))
+    downs = []
+    for _, up in directions:
+        bed = (V @ up).min() + bed_tol
+        downs.append(good & (n @ up < -limit) & (c @ up > bed))
+    either = np.where(downs[0] | downs[1])[0]
+    cls = np.full(len(F), -1)
+    if len(either):
+        q = tensor(c[either])
+        d_skin = S_helm.compute_distance(q).numpy()
+        d_head = np.abs(signed_distance(S_head, c[either]))
+        toward = np.einsum("ij,ij->i", n[either], centre - c[either]) > 0      # normal points toward the head centre
+        is_skin = d_skin <= skin_tol
+        is_liner = ~is_skin & (d_head <= liner_tol)
+        cls[either] = np.select([is_skin & ~toward, is_skin & toward, is_liner & toward, is_liner & ~toward],
+                                [0, 1, 2, 3], default=4)
+    names = ["shell, outer face", "shell, inner face (roof over the lattice)", "liner, head side",
+             "liner, lattice side (roof)", "lattice walls"]
     to_unit = 1e4 if H < 2.0 else 1.0
+    unit = "cm^2" if H < 2.0 else "units^2"
     print(f"FDM overhangs (faces pointing down by more than {angle:g} deg from vertical walls; area, {unit}):")
-    for name, up in (("crown-up (rim on the bed)", np.array([0.0, 1.0, 0.0])), ("crown-down (crown on the bed)", np.array([0.0, -1.0, 0.0]))):
-        heights = V @ up
-        bed = heights.min() + (0.001 if H < 2.0 else 1.0)
-        down = (n @ up < -cos_limit) & (c @ up > bed)
-        parts = ", ".join(f"{label} {(weight[down & m]).sum() * to_unit:.0f}" for label, m in classes)
-        print(f"   {name}: {(weight[down]).sum() * to_unit:.0f} in all ({parts})")
+    for (name, _), down in zip(directions, downs):
+        parts = ", ".join(f"{label} {area[down & (cls == k)].sum() * to_unit:.0f}" for k, label in enumerate(names))
+        print(f"   {name}: {area[down].sum() * to_unit:.0f} in all ({parts})")
 
 
 def shell_checks(S_out, S_helm, centre, R, vents, H, v, vs, args):
@@ -592,14 +597,27 @@ def main():
 
     labels, counts, _ = out.cluster_connected_triangles()
     counts = np.asarray(counts)
-    tiny = int((counts < 0.001 * counts.max()).sum())
+    # Pieces by signed volume: inward-facing ones are air pockets sealed inside
+    # the solid (the re-entrant cells closed by liner and shell), outward ones
+    # are solid; a solid piece under 1e-4 of the largest is a loose fragment.
+    labels = np.asarray(labels)
+    Tv = np.asarray(out.vertices)[np.asarray(out.triangles)]
+    piece_volume = np.bincount(labels, weights=np.einsum("ij,ij->i", Tv[:, 0], np.cross(Tv[:, 1], Tv[:, 2])) / 6.0,
+                               minlength=len(counts))
+    if piece_volume.sum() < 0:
+        piece_volume = -piece_volume
+    pockets = int((piece_volume < 0).sum())
+    solid_pieces = piece_volume[piece_volume > 0]
+    fragments = int((solid_pieces < 1e-4 * solid_pieces.max()).sum()) if len(solid_pieces) else 0
 
     unit = "L" if H < 2.0 else "model units^3"          # metres in, litres out
     k = 1e3 if H < 2.0 else 1.0
     total = vol(solid) if solid.any() else 1.0
     pct = lambda m: 100 * vol(m) / total
-    print(f"output: {len(out.triangles):,} triangles, {len(counts)} connected pieces "
-          f"({tiny} tiny fragments; largest piece {100 * counts.max() / counts.sum():.1f}% of triangles)")
+    print(f"output: {len(out.triangles):,} triangles, {len(counts)} connected pieces: "
+          f"{len(solid_pieces)} solid ({fragments} loose fragments under 1e-4 of the main body), "
+          f"{pockets} sealed air pockets ({-np.asarray(piece_volume)[piece_volume < 0].sum() * (1e6 if H < 2 else 1):.0f}"
+          f"{' cm^3' if H < 2 else ''})")
     print(f"solid material, sampled every {g*1000 if H < 2 else g:.2f}{' mm' if H < 2 else ''}:")
     print(f"   helmet skin              {vol(is_skin)*k:8.3f} {unit}")
     print(f"   head-side liner          {vol(is_liner)*k:8.3f} {unit}")

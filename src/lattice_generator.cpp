@@ -5,6 +5,7 @@
 #include "helmet_cavity.h"
 #include "helmet_fit.h"
 #include "lattice_struts.h"
+#include "mesh_components.h"
 #include "mesh_distance.h"
 
 #include <igl/parallel_for.h>
@@ -159,6 +160,40 @@ void log_simplification(const MeshStatistics& statistics, double tolerance)
               << statistics.refused_pieces << ".\n";
 }
 
+// Printable mode's last step, for both the coarse and the fine path: drop
+// loose fragments (keep the main body, every air pocket, and any larger extra
+// piece, reported), then check the mesh is still closed.
+bool finish_printable(GeneratedMesh& output, const GenerationOptions& options, std::string& error)
+{
+    if (!(options.simplify_tolerance > 0.0))
+    {
+        return true;
+    }
+    FragmentReport report;
+    remove_fragments(output.vertices, output.faces, 1e-4, report);
+    std::cout << "  pieces: main body " << report.main_volume << ", " << report.pockets
+              << " sealed air pockets (" << report.pocket_volume << "), loose fragments removed "
+              << report.removed << " (" << report.removed_volume << ") (model units cubed).\n";
+    if (report.large_extra > 0)
+    {
+        std::cout << "  WARNING: " << report.large_extra << " separate solid piece(s) of "
+                  << report.large_extra_volume << " besides the main body (kept): part of the "
+                     "helmet is not joined to the rest.\n";
+    }
+    std::size_t boundary_edges = 0;
+    std::size_t nonmanifold_edges = 0;
+    std::size_t at_bounds = 0;
+    if (output.faces.rows() == 0 ||
+        !closed_two_manifold(output.faces, output.vertices, output.vertices.colwise().minCoeff(),
+                             output.vertices.colwise().maxCoeff(), output.voxel_size,
+                             boundary_edges, nonmanifold_edges, at_bounds))
+    {
+        error = "Internal: the mesh is not closed after removing fragments.";
+        return false;
+    }
+    return true;
+}
+
 // What the fine surface needs from the coarse pass.
 struct FineContext
 {
@@ -182,6 +217,8 @@ struct FineContext
     Eigen::RowVector3d grid_last;
     LatticeType lattice_type;
     const ReentrantCell* reentrant;              // null: the lattice is the original auxetic or the gyroid
+    double chamfer_degrees;                      // roof chamfer to the liner (re-entrant only); 0 = none
+    double chamfer_reach;                        // its reach from the walls along the liner
     double cell_size;
     Eigen::RowVector3d lattice_anchor;
     double shell_thickness;
@@ -216,6 +253,12 @@ bool generate_fine_surface(const FineContext& c, GeneratedMesh& output, std::str
     const double swept_reach = diagonal + 0.25 * v;      // + the coarse sweep's own error
     const double swept_near = swept_reach + v;
     const double liner_outer = c.liner_center_distance + c.liner_thickness * 0.5;
+    // With a roof chamfer the liner's value matters further out: the chamfer
+    // reaches this far beyond the liner along the walls. The exact-distance
+    // zone and the block selection grow by it (a bound there could otherwise
+    // put chamfer material where there is none).
+    const double chamfer_depth = c.chamfer_degrees > 0.0
+        ? c.chamfer_reach * std::tan(c.chamfer_degrees * 3.14159265358979323846 / 180.0) : 0.0;
     const double sweep_margin = 7.0 * v;                 // as for the coarse sweep
     const Eigen::RowVector3d sweep_box_min = c.head_min.array() - sweep_margin;
     const Eigen::RowVector3d sweep_box_max = c.head_max.array() + sweep_margin;
@@ -247,7 +290,7 @@ bool generate_fine_surface(const FineContext& c, GeneratedMesh& output, std::str
                         any = true;                                  // shell
                     }
                     else if (c.covered_near[i] &&
-                             (c.swept[i] <= liner_outer + swept_near ||   // liner
+                             (c.swept[i] <= liner_outer + chamfer_depth + swept_near ||   // liner (+ chamfer)
                               (c.inside_helmet[i] < 3.0 * v &&            // lattice
                                c.swept[i] >= c.head_clearance - swept_near)))
                     {
@@ -353,12 +396,14 @@ bool generate_fine_surface(const FineContext& c, GeneratedMesh& output, std::str
     // Walls: exact within this centreline distance, at least reach - wall/2
     // beyond. That is more than a tetrahedron edge (sqrt 3 spacing) outside any
     // wall, so an edge never joins an inside sample to a capped one.
+    // With a chamfer, wall distances must be exact as far as it reaches.
     const double wall_reach = c.reentrant != nullptr
-        ? 0.5 * c.reentrant->wall_thickness + 3.0 * fine.spacing : 0.0;
+        ? 0.5 * c.reentrant->wall_thickness + c.chamfer_reach + 3.0 * fine.spacing : 0.0;
 
     std::atomic<std::size_t> exact_shell{0};
     std::atomic<std::size_t> exact_swept{0};
     std::atomic<std::size_t> lattice_points{0};
+    std::atomic<std::size_t> chamfer_points{0};
     const BlockField field = [&](const FineBlock& block, std::vector<double>& values)
     {
         std::vector<double> lattice(block.sample_count(), std::numeric_limits<double>::infinity());
@@ -391,6 +436,7 @@ bool generate_fine_surface(const FineContext& c, GeneratedMesh& output, std::str
         std::size_t local_shell = 0;
         std::size_t local_swept = 0;
         std::size_t local_lattice = 0;
+        std::size_t local_chamfer = 0;
         for (unsigned k = 0; k < block.sz; ++k)
         {
             for (unsigned j = 0; j < block.sy; ++j)
@@ -463,7 +509,7 @@ bool generate_fine_surface(const FineContext& c, GeneratedMesh& output, std::str
                         }
                         double swept;
                         if (c.options.fine_exact || !all_computed ||
-                            smallest <= liner_outer + swept_near)
+                            smallest <= liner_outer + chamfer_depth + swept_near)
                         {
                             swept = swept_head_distance_at(
                                 coarse_head, c.lift.direction, sweep_box_min, sweep_box_max,
@@ -485,6 +531,19 @@ bool generate_fine_surface(const FineContext& c, GeneratedMesh& output, std::str
                             ++local_lattice;
                         }
                         value = std::min({shell, inner_liner, clipped_lattice});
+                        if (c.chamfer_degrees > 0.0)
+                        {
+                            // Slopes from the walls up to the liner, clipped
+                            // exactly as the lattice is (cavity, head clearance).
+                            const double chamfer = std::max({
+                                roof_chamfer(lattice[local], inner_liner, c.chamfer_degrees, c.chamfer_reach),
+                                inside, -swept + c.head_clearance});
+                            if (chamfer < 0.0 && value >= 0.0)
+                            {
+                                ++local_chamfer;
+                            }
+                            value = std::min(value, chamfer);
+                        }
                     }
                     values[local] = value;
                 }
@@ -493,6 +552,7 @@ bool generate_fine_surface(const FineContext& c, GeneratedMesh& output, std::str
         exact_shell += local_shell;
         exact_swept += local_swept;
         lattice_points += local_lattice;
+        chamfer_points += local_chamfer;
     };
 
     const double isovalue = fine.spacing * 0.05;
@@ -509,6 +569,7 @@ bool generate_fine_surface(const FineContext& c, GeneratedMesh& output, std::str
     std::cout << "  block samples (shared faces counted per block): " << statistics.samples
               << "; exact distances: shell at " << exact_shell.load() << ", swept head at "
               << exact_swept.load() << "; lattice material at " << lattice_points.load()
+              << (c.chamfer_degrees > 0.0 ? "; roof chamfer adds material at " + std::to_string(chamfer_points.load()) : std::string())
               << "; " << output.faces.rows() << " triangles; "
               << fixed1(seconds) << " s.\n";
     if (lattice_points.load() == 0)
@@ -571,17 +632,27 @@ bool generate_final_helmet(
         error = "Invalid fine-grid options.";
         return false;
     }
-    const bool reentrant = options.auxetic_cell == AuxeticCell::Reentrant;
+    // The cell setting is the auxetic lattice's; the gyroid ignores it (so a
+    // re-entrant default does not stop the gyroid from being generated).
+    const bool reentrant = options.auxetic_cell == AuxeticCell::Reentrant &&
+                           lattice_type == LatticeType::Auxetic;
     if (!std::isfinite(options.simplify_tolerance) || options.simplify_tolerance < 0.0 ||
         !std::isfinite(options.line_width) || options.line_width < 0.0)
     {
         error = "Invalid simplification tolerance or line width.";
         return false;
     }
-    if (reentrant && lattice_type != LatticeType::Auxetic)
+    if (!std::isfinite(options.roof_chamfer_degrees) ||
+        (options.roof_chamfer_degrees != 0.0 &&
+         (options.roof_chamfer_degrees < 45.0 || options.roof_chamfer_degrees > 80.0)))
     {
-        error = "The re-entrant cell is an auxetic lattice: use it with --lattice auxetic.";
+        error = "The roof chamfer must be 0 (none) or 45-80 degrees from horizontal.";
         return false;
+    }
+    const double chamfer_degrees = reentrant ? options.roof_chamfer_degrees : 0.0;
+    if (options.roof_chamfer_degrees > 0.0 && !reentrant)
+    {
+        std::cout << "NOTE: the roof chamfer belongs to the re-entrant cell; not used here.\n";
     }
     if (reentrant && !fine)
     {
@@ -1144,7 +1215,15 @@ bool generate_final_helmet(
     }
 
     output.cell_size = std::min(head_height / 9.0, maximum_gap_half_width * 1.5);
-    const Eigen::RowVector3d lattice_anchor = combined_min;
+    // The re-entrant pattern is anchored on the head's centre in X and Z: a
+    // column of upright walls on the midline makes it mirror-symmetric left
+    // to right (the fitted helmet's mirror plane), and the front-back phase is
+    // fixed by the head, not by the box. The original cell and the gyroid keep
+    // the combined model bounds (outputs unchanged).
+    const Eigen::RowVector3d head_centre = 0.5 * (head_min + head_max);
+    const Eigen::RowVector3d lattice_anchor = reentrant
+        ? Eigen::RowVector3d(head_centre.x(), combined_min.y(), head_centre.z())
+        : combined_min;
     std::cout << "Maximum sampled gap half-width: "
               << maximum_gap_half_width << " (model units).\n";
     if (reentrant)
@@ -1158,10 +1237,18 @@ bool generate_final_helmet(
                   << ", h " << cell.h << "; repeat " << cell.width << " across X x "
                   << 2.0 * cell.dz << " along Z (rows " << cell.dz << " apart); walls "
                   << cell.wall_thickness << ", clear gap " << cell.clear_gap
-                  << " (model units; anchored to the combined model bounds).\n"
+                  << " (model units).\n"
                   << "  ideal (thin-wall) Poisson's ratio: " << nu_x << " squeezed along X, "
                   << nu_z << " along Z; for these walls run analysis_tools/poisson_frame.py "
                      "--cell-width/--cell-angle/--wall-thickness (in mm).\n";
+        std::cout << "  pattern anchored on the head's centre (X " << lattice_anchor.x() << ", Z "
+                  << lattice_anchor.z() << "): mirror-symmetric about X = " << lattice_anchor.x() << ".\n";
+        if (chamfer_degrees > 0.0)
+        {
+            std::cout << "  roof chamfer: " << chamfer_degrees << " deg slopes from the walls up to the liner, "
+                         "reaching " << 1.02 * cell.largest_opening << " (the cells' largest opening "
+                      << cell.largest_opening << ").\n";
+        }
         if (room_min > 0.0)
         {
             std::cout << "  through the thinnest room (" << room_min << "): about "
@@ -1180,10 +1267,15 @@ bool generate_final_helmet(
             grid, surface_grid, options, head_vertices, head_faces, helmet_vertices,
             helmet_faces, cavity, lift, head_distance, shell_field, swept, swept_computed,
             inside_helmet, covered_near, head_min, head_max, grid_last, lattice_type,
-            reentrant ? &cell : nullptr,
+            reentrant ? &cell : nullptr, chamfer_degrees,
+            chamfer_degrees > 0.0 ? 1.02 * cell.largest_opening : 0.0,
             output.cell_size, lattice_anchor, shell_thickness, wall_skin,
             liner_center_distance, liner_thickness, head_clearance, cavity_margin};
-        return generate_fine_surface(context, output, error);
+        if (!generate_fine_surface(context, output, error))
+        {
+            return false;
+        }
+        return finish_printable(output, options, error);
     }
 
     std::vector<float> lattice_distance(
@@ -1297,5 +1389,5 @@ bool generate_final_helmet(
                 + std::to_string(boundary_grid_edges) + " at grid bounds).";
         return false;
     }
-    return true;
+    return finish_printable(output, options, error);
 }

@@ -99,6 +99,10 @@ struct ReentrantCell
     double slant_dz = 0.0;         // l sin(theta) (< 0)
     double centreline_gap = 0.0;   // closest approach of walls that share no node
     double clear_gap = 0.0;        // centreline_gap - wall_thickness
+    // Radius of the largest empty circle between the walls (from their
+    // surfaces): how far a roof chamfer must reach to close a cell's roof.
+    // An upper bound, within a fiftieth of a row's spacing.
+    double largest_opening = 0.0;
 };
 
 // h / l giving Gibson-Ashby nu = -1 both ways: cos^2(t) / (-sin t) - sin t.
@@ -125,6 +129,16 @@ std::vector<std::array<Eigen::Vector2d, 2>> reentrant_segments(
 // distance to the wall centrelines minus half the wall thickness, the same at
 // every height. Exact wherever the centreline distance is below `reach`;
 // elsewhere at least reach - wall / 2. A pure function of p.
+// A chamfer under a roof (step 4d), for printing a roof over open cells
+// without bridging: a sloped face rising at `angle_degrees` from horizontal,
+// from the walls up to the roof, meeting the roof `reach` away from the
+// walls (and the walls reach * tan(angle) below the roof). `wall` and
+// `roof` are the distances to the wall and roof surfaces (positive in the
+// open cell); the result is negative in the chamfer. Take the minimum with
+// the walls and the roof for the solid. Steeper than 45 degrees, the slope
+// needs no support.
+double roof_chamfer(double wall, double roof, double angle_degrees, double reach);
+
 double reentrant_wall_distance(
     const Eigen::RowVector3d& p,
     const ReentrantCell& cell,

@@ -32,6 +32,9 @@ add_executable(me323
     src/mesh_distance.cpp
     src/fine_grid.cpp
     src/mesh_simplify.cpp
+    src/mesh_components.cpp
+    src/print_export.cpp
+    src/coupon.cpp
 )
 
 target_link_libraries(me323
