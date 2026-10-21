@@ -174,6 +174,27 @@ int main(int argc, char** argv)
     bool fine_exact = false;           // tests: exact distances at every fine sample
     bool fine_all_blocks = false;      // tests: evaluate every block, skip none
     unsigned fine_block_cells = 8;     // tests: block size in coarse cells
+    GenerationOptions cell_defaults;   // step 4b: the re-entrant cell and simplification
+    AuxeticCell auxetic_cell = cell_defaults.auxetic_cell;
+    double cell_width = cell_defaults.cell_width;
+    double cell_angle = cell_defaults.cell_angle_degrees;
+    double cell_h_ratio = cell_defaults.cell_h_ratio;
+    double wall_thickness = cell_defaults.wall_thickness;
+    double line_width = cell_defaults.line_width;
+    double simplify_tolerance = cell_defaults.simplify_tolerance;
+    // A number from argv[argument], or false (and a message) if it is not one
+    // or fails the check.
+    const auto read_number = [&](int at, double& value, bool (*ok)(double), const char* what)
+    {
+        char* end = nullptr;
+        value = std::strtod(argv[at], &end);
+        if (end == argv[at] || *end != '\0' || !std::isfinite(value) || !ok(value))
+        {
+            std::cerr << what << '\n';
+            return false;
+        }
+        return true;
+    };
     for (int argument = 1; argument < argc; ++argument)
     {
         const std::string option = argv[argument];
@@ -249,6 +270,77 @@ int main(int argc, char** argv)
                 return 2;
             }
         }
+        else if (option == "--cell" && argument + 1 < argc)
+        {
+            const std::string requested = argv[++argument];
+            if (requested == "original")
+            {
+                auxetic_cell = AuxeticCell::Original;
+            }
+            else if (requested == "reentrant")
+            {
+                auxetic_cell = AuxeticCell::Reentrant;
+            }
+            else
+            {
+                std::cerr << "Unknown cell: " << requested
+                          << ". Choose 'original' or 'reentrant'.\n";
+                return 2;
+            }
+        }
+        else if (option == "--cell-width" && argument + 1 < argc)
+        {
+            if (!read_number(++argument, cell_width, [](double v) { return v > 0.0; },
+                             "--cell-width needs a positive size in the head file's units "
+                             "(0.010 = 10 mm for a head in metres)."))
+            {
+                return 2;
+            }
+        }
+        else if (option == "--cell-angle" && argument + 1 < argc)
+        {
+            if (!read_number(++argument, cell_angle,
+                             [](double v) { return v >= -60.0 && v <= -10.0; },
+                             "--cell-angle needs degrees from -60 to -10 (negative = re-entrant)."))
+            {
+                return 2;
+            }
+        }
+        else if (option == "--cell-h-ratio" && argument + 1 < argc)
+        {
+            if (!read_number(++argument, cell_h_ratio, [](double v) { return v >= 0.0; },
+                             "--cell-h-ratio needs h / l > 0 (0 = the ideal-nu value)."))
+            {
+                return 2;
+            }
+        }
+        else if (option == "--wall-thickness" && argument + 1 < argc)
+        {
+            if (!read_number(++argument, wall_thickness, [](double v) { return v > 0.0; },
+                             "--wall-thickness needs a positive size in the head file's units "
+                             "(0.0012 = 1.2 mm)."))
+            {
+                return 2;
+            }
+        }
+        else if (option == "--line-width" && argument + 1 < argc)
+        {
+            if (!read_number(++argument, line_width, [](double v) { return v >= 0.0; },
+                             "--line-width needs a size >= 0 in the head file's units "
+                             "(0.0004 = 0.4 mm; 0 = no check)."))
+            {
+                return 2;
+            }
+        }
+        else if (option == "--simplify" && argument + 1 < argc)
+        {
+            if (!read_number(++argument, simplify_tolerance, [](double v) { return v >= 0.0; },
+                             "--simplify needs a tolerance >= 0 in the head file's units "
+                             "(0.00005 = 0.05 mm; 0 = off)."))
+            {
+                return 2;
+            }
+        }
         else if (option == "--fine-exact")
         {
             fine_exact = true;
@@ -275,7 +367,11 @@ int main(int argc, char** argv)
             {
                 startup_lattice = LatticeType::Auxetic;
             }
-            else if (requested != "tpms")
+            else if (requested == "tpms")
+            {
+                startup_lattice = LatticeType::Gyroid;    // also when it follows an earlier --lattice auxetic
+            }
+            else
             {
                 std::cerr << "Unknown lattice case: " << requested
                           << ". Choose 'auxetic' or 'tpms'.\n";
@@ -288,6 +384,10 @@ int main(int argc, char** argv)
                          " [--export-fit] [--fit zoom|stretch] [--lattice-room <size>]"
                          " [--shell wall|band] [--shell-skin <cells>]"
                          " [--fine-spacing <size>]\n"
+                         "       [--cell original|reentrant] [--cell-width <size>]"
+                         " [--cell-angle <deg>] [--cell-h-ratio <h/l>]\n"
+                         "       [--wall-thickness <size>] [--line-width <size>]"
+                         " [--simplify <tolerance>]\n"
                          "       test options: [--fine-exact] [--fine-all-blocks]"
                          " [--fine-block-cells <n>]\n";
             return 2;
@@ -508,6 +608,13 @@ int main(int argc, char** argv)
         options.fine_exact = fine_exact;
         options.fine_all_blocks = fine_all_blocks;
         options.fine_block_cells = fine_block_cells;
+        options.auxetic_cell = auxetic_cell;
+        options.cell_width = cell_width;
+        options.cell_angle_degrees = cell_angle;
+        options.cell_h_ratio = cell_h_ratio;
+        options.wall_thickness = wall_thickness;
+        options.line_width = line_width;
+        options.simplify_tolerance = simplify_tolerance;
         if (!generate_final_helmet(
                 fitted_head, F_head, head_lid.faces, fitted_helmet, F_helmet,
                 type, generated, error, options))

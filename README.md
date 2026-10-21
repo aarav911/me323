@@ -694,6 +694,29 @@ output is exactly what it was. For the Run_2 stretch fit, 0.0005 gives a
 are for testing (exact distances everywhere, no skipped blocks, block size); the
 mesh must not depend on them.
 
+`--cell reentrant` replaces the auxetic lattice with the textbook re-entrant
+honeycomb (rows offset by half a repeat) drawn in the horizontal plane and
+extruded straight up as continuous walls, which an FDM printer builds layer on
+layer without overhangs: `--cell-width` (repeat side to side, default 0.010),
+`--cell-angle` (default -35 degrees), `--cell-h-ratio` (h / l, default the value
+giving an ideal Poisson's ratio of -1), `--wall-thickness` (default 0.0012),
+`--line-width` (default 0.0004, only to warn when the wall is not a whole number
+of extrusion lines). It needs `--fine-spacing` (the walls are thinner than the
+coarse grid); the program refuses a cell whose walls would nearly touch, a grid
+too coarse for the walls, and sizes that look like the wrong units. Check a cell
+first with `analysis_tools/poisson_frame.py --cell-width 10 --cell-angle -35
+--wall-thickness 1.2` (mm): Poisson's ratio both ways, stiffness, gap. The default
+`--cell original` is the original lattice, unchanged.
+
+`--simplify <tolerance>` (e.g. 0.00005 = 0.05 mm) makes a printable mesh: each
+block is simplified as soon as it is meshed, with a guaranteed bound (every
+original point within the tolerance of the result and every new vertex within it
+of the original), no self-intersections, the blocks still matching exactly, and
+no two vertices close enough to merge in the 32-bit STL. For the Run_2 stretch fit,
+`--fine-spacing 0.0004 --cell reentrant --simplify 0.00005` gives 5.9 M triangles
+(a 293 MB STL; unsimplified it would be about 119 M) in about 11 minutes with 2.2 GB
+of memory.
+
 `tools/check_output.py` independently checks an output (Python with numpy,
 scipy, open3d; matplotlib for `--png`), with Open3D rather than libigl. It sorts
 the solid material into helmet skin, head-side liner, lattice inside the
@@ -704,7 +727,9 @@ the head passes through for the best straight lift-off direction. It also
 checks the shell (step 3b): rays aimed at the head from outside must meet the
 output near the stock outer face (no holes), and the middle of the stock wall
 must be solid; and it estimates the mass (`--density`, default 1.0 g/cm³).
-`--shell` / `--shell-skin` / `--fine-spacing` must match the generator's:
+`--shell` / `--shell-skin` / `--fine-spacing` must match the generator's. The
+checker also prints the mesh's exact enclosed volume, and with `--overhangs` the
+area an FDM print would have to bridge or support printed crown-up or crown-down:
 
 ``` bash
 ./build/me323 --lattice auxetic --generate-only --export-fit

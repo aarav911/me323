@@ -393,6 +393,65 @@ def step3(T, lid, centre, helm, S_helm, R, U, step, args, in_way_skin):
     return verdict
 
 
+def exact_volume(mesh):
+    """Enclosed volume of a closed mesh: sum of signed tetrahedra to the origin.
+    (Not Open3D's get_volume(), which first runs a very slow self-intersection
+    test.) Positive when the triangles face outward."""
+    V = np.asarray(mesh.vertices)
+    T = V[np.asarray(mesh.triangles)]
+    return float(np.einsum("ij,ij->i", T[:, 0], np.cross(T[:, 1], T[:, 2])).sum() / 6.0)
+
+
+def overhang_report(mesh, S_head, S_helm, centre, skin_tol, liner_tol, angle, H):
+    """Downward-facing area an FDM print would have to bridge or support, for
+    the two ways the walls can grow (along the helmet's up axis): crown-up
+    (rim on the bed, build direction +Y) and crown-down (crown on the bed,
+    build -Y). A face overhangs if it leans more than `angle` past vertical,
+    i.e. its outward normal points down by more than `angle` below the
+    horizontal (n . down > sin angle). Faces within 1 mm of the bed are not
+    counted (they sit on it). Split by
+    surface (centroid nearest to the shell: skin; to the head: liner; else
+    lattice), and for skin and liner by side (normal toward the head centre or
+    away), so the overhangs inside the part (the roof closing the lattice) show
+    apart from those outside it (supportable). Up to 1M triangles, sampled by
+    area, are classified."""
+    V = np.asarray(mesh.vertices)
+    F = np.asarray(mesh.triangles)
+    T = V[F]
+    N = np.cross(T[:, 1] - T[:, 0], T[:, 2] - T[:, 0])
+    area = 0.5 * np.linalg.norm(N, axis=1)
+    if exact_volume(mesh) < 0:
+        N = -N
+    good = area > 0
+    rng = np.random.default_rng(11)
+    idx = np.where(good)[0]
+    if len(idx) > 1_000_000:
+        idx = np.sort(rng.choice(idx, 1_000_000, replace=False, p=area[idx] / area[idx].sum()))
+        weight = np.full(len(idx), area[good].sum() / len(idx))
+    else:
+        weight = area[idx]
+    n = N[idx] / np.linalg.norm(N[idx], axis=1)[:, None]
+    c = T[idx].mean(axis=1)
+    d_skin = S_helm.compute_distance(tensor(c)).numpy()
+    d_head = np.abs(signed_distance(S_head, c))
+    toward = np.einsum("ij,ij->i", n, centre - c) > 0          # normal points toward the head centre
+    is_skin = d_skin <= skin_tol
+    is_liner = ~is_skin & (d_head <= liner_tol)
+    classes = [("shell, outer face", is_skin & ~toward), ("shell, inner face (roof over the lattice)", is_skin & toward),
+               ("liner, head side", is_liner & toward), ("liner, lattice side (roof)", is_liner & ~toward),
+               ("lattice walls", ~is_skin & ~is_liner)]
+    cos_limit = np.cos(np.radians(90.0 - angle))
+    unit = "cm^2" if H < 2.0 else "units^2"
+    to_unit = 1e4 if H < 2.0 else 1.0
+    print(f"FDM overhangs (faces pointing down by more than {angle:g} deg from vertical walls; area, {unit}):")
+    for name, up in (("crown-up (rim on the bed)", np.array([0.0, 1.0, 0.0])), ("crown-down (crown on the bed)", np.array([0.0, -1.0, 0.0]))):
+        heights = V @ up
+        bed = heights.min() + (0.001 if H < 2.0 else 1.0)
+        down = (n @ up < -cos_limit) & (c @ up > bed)
+        parts = ", ".join(f"{label} {(weight[down & m]).sum() * to_unit:.0f}" for label, m in classes)
+        print(f"   {name}: {(weight[down]).sum() * to_unit:.0f} in all ({parts})")
+
+
 def shell_checks(S_out, S_helm, centre, R, vents, H, v, vs, args):
     """Is the shell there and where it should be? Over the directions the helmet
     covers, away from vents and edges (one map cell in from them):
@@ -464,6 +523,10 @@ def main():
     ap.add_argument("--shell-skin", type=float, default=0.5, help="the generator's --shell-skin, grid cells")
     ap.add_argument("--fine-spacing", type=float, default=0.0,
                     help="the generator's --fine-spacing (0 = off), for the wall skin in the allowance and shell checks")
+    ap.add_argument("--overhangs", action="store_true",
+                    help="report FDM overhang area for crown-up and crown-down printing")
+    ap.add_argument("--overhang-angle", type=float, default=45.0,
+                    help="overhang limit, degrees from vertical (default 45)")
     ap.add_argument("--density", type=float, default=1.0, help="g/cm^3 for the mass estimate (printed nylon ~0.95-1.0)")
     args = ap.parse_args()
 
@@ -545,6 +608,14 @@ def main():
     if H < 2.0:
         print(f"   total {vol(solid)*1e6:.0f} cm^3 -> about {vol(solid)*1e3*args.density:.2f} kg at {args.density:g} g/cm^3 "
               f"(skin {vol(is_skin)*1e6:.0f}, liner {vol(is_liner)*1e6:.0f}, lattice {vol(is_lattice)*1e6:.0f} cm^3)")
+    volume = exact_volume(out)
+    if H < 2.0:
+        print(f"   exact mesh volume {abs(volume)*1e6:.0f} cm^3 -> {abs(volume)*1e3*args.density:.2f} kg at "
+              f"{args.density:g} g/cm^3 (the split above is sampled; this total is exact)")
+    else:
+        print(f"   exact mesh volume {abs(volume):.4g} {unit}")
+    if args.overhangs:
+        overhang_report(out, S_head, S_helm, centre, skin_tol, liner_tol, args.overhang_angle, H)
     under_vent = np.logical_and.reduce([vents[c] for c in corners])
     print(f"   (liner under the vents   {vol(is_liner & under_vent)*k:8.3f} {unit}; vents are bridged, not open)")
 

@@ -11,6 +11,12 @@ enum class LatticeType
     Gyroid
 };
 
+enum class AuxeticCell
+{
+    Original,
+    Reentrant
+};
+
 // How the helmet shell is made solid.
 //   Wall: the stock helmet's own wall (inside its closed mesh, by winding
 //         number) plus a thin skin of wall_skin_cells grid cells on every
@@ -48,6 +54,19 @@ struct GenerationOptions
     bool fine_exact = false;             // test: every fine distance exact, no bounds
     bool fine_all_blocks = false;        // test: evaluate every block, skip none
     unsigned fine_block_cells = 8;       // coarse cells per block side
+    // The auxetic lattice's cell. Original: Aarav's cell (struts on a square
+    // grid, sized from the gap). Reentrant (step 4b): the textbook re-entrant
+    // honeycomb as vertical walls (lattice_struts.h, ReentrantCell), sizes in
+    // model units; needs fine_spacing (thin walls) and LatticeType::Auxetic.
+    AuxeticCell auxetic_cell = AuxeticCell::Original;
+    double cell_width = 0.010;           // repeat across X
+    double cell_angle_degrees = -35.0;
+    double cell_h_ratio = 0.0;           // h / l; 0 = the ideal-nu value
+    double wall_thickness = 0.0012;
+    double line_width = 0.0004;          // FDM line width: warn if the wall is not whole lines; 0 = no check
+    // Simplify the mesh to within this distance (model units, mesh_simplify.h);
+    // 0 = leave it as extracted.
+    double simplify_tolerance = 0.0;
 };
 
 bool generate_final_helmet(

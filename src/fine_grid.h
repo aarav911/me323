@@ -85,6 +85,14 @@ struct MeshStatistics
     std::size_t blocks = 0;
     std::size_t samples = 0;
     std::size_t negative_samples = 0;   // field < isovalue
+    // Simplification (simplify_tolerance > 0): pieces simplified / left as
+    // they were because too small / refused (see mesh_simplify.h), and
+    // triangles before and after.
+    std::size_t simplified_pieces = 0;
+    std::size_t small_pieces = 0;
+    std::size_t refused_pieces = 0;
+    std::size_t faces_before = 0;
+    std::size_t faces_after = 0;
 };
 
 // Marching tetrahedra over the blocks (in parallel), merged in block order so
@@ -95,6 +103,15 @@ struct MeshStatistics
 // lower-index end so both blocks make them identically. One block over the
 // whole grid gives the same mesh, triangle for triangle and bit for bit, as
 // the original single-grid marching_tetrahedra().
+//
+// simplify_tolerance > 0 (printable output): each block's piece is simplified
+// as soon as it is meshed (mesh_simplify.h), with every vertex it shares with
+// a neighbouring block locked, so the blocks still match exactly and the raw
+// mesh never has to exist all at once. Also, samples within a thousandth of a
+// spacing of the isovalue are moved that far off it, and no crossing is placed
+// within a thousandth of an edge of either end, so no two vertices end up
+// close enough to merge in a 32-bit STL (the surface moves by at most that
+// much). 0 (the default) leaves the output exactly as above.
 bool mesh_blocks(
     const FineGrid& grid,
     const std::vector<FineBlock>& blocks,
@@ -103,7 +120,8 @@ bool mesh_blocks(
     Eigen::MatrixXd& vertices,
     Eigen::MatrixXi& faces,
     MeshStatistics& statistics,
-    std::string& error);
+    std::string& error,
+    double simplify_tolerance = 0.0);
 
 // Every edge used by exactly two triangles? Sorts the edge keys instead of
 // hashing them (same counts, a fraction of the memory for large meshes).

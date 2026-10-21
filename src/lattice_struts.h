@@ -2,7 +2,9 @@
 
 #include <Eigen/Core>
 
+#include <array>
 #include <cstddef>
+#include <string>
 #include <vector>
 
 // The lattice as geometry, independent of any sampling grid, so the coarse
@@ -72,3 +74,59 @@ extern template void rasterize_strut<float>(
     const SampleBox&, const Strut&, double, double, std::vector<float>&);
 extern template void rasterize_strut<double>(
     const SampleBox&, const Strut&, double, double, std::vector<double>&);
+
+// The corrected auxetic lattice (step 4b): the textbook re-entrant honeycomb
+// (Gibson & Ashby; every other row shifted by half a repeat) drawn in the
+// horizontal XZ plane and extruded straight up (Y) as continuous walls, which
+// an FDM printer builds layer on layer with no overhangs. In XZ, relative to
+// the anchor, a node sits at column c and row r wherever c and r have the same
+// parity: the bottom node (c dx, r dz). From it a wall of length h goes up +Z
+// to the top node (c dx, r dz + h), and from there two walls of length l slant
+// at `angle` (negative = re-entrant) down to the next row's bottom nodes at
+// columns c - 1 and c + 1. dx = l cos(angle), dz = h + l sin(angle); the repeat
+// is 2 dx (= width) across X and 2 dz along Z. Same layout as textbook() in
+// analysis_tools/poisson_frame.py, whose beam model gives this cell's nu.
+struct ReentrantCell
+{
+    double width = 0.0;            // repeat across X
+    double angle_degrees = 0.0;    // theta, negative
+    double h_ratio = 0.0;          // h / l
+    double wall_thickness = 0.0;
+    double l = 0.0;
+    double h = 0.0;
+    double dx = 0.0;               // l cos(theta): half the repeat across X
+    double dz = 0.0;               // h + l sin(theta): row spacing along Z
+    double slant_dz = 0.0;         // l sin(theta) (< 0)
+    double centreline_gap = 0.0;   // closest approach of walls that share no node
+    double clear_gap = 0.0;        // centreline_gap - wall_thickness
+};
+
+// h / l giving Gibson-Ashby nu = -1 both ways: cos^2(t) / (-sin t) - sin t.
+double reentrant_ideal_h_ratio(double angle_degrees);
+
+// Derives the cell and checks it: finite values, -60 <= angle <= -10, width
+// and wall > 0, rows that advance (dz > 0), and walls that do not meet at
+// least a wall thickness apart (brute force over a patch). h_ratio 0 means the
+// ideal value.
+bool make_reentrant_cell(
+    double width, double angle_degrees, double h_ratio, double wall_thickness,
+    ReentrantCell& cell, std::string& error);
+
+// Gibson-Ashby (thin-wall) Poisson's ratios: squeezed along X, and along Z.
+void reentrant_ideal_poisson(const ReentrantCell& cell, double& nu_x, double& nu_z);
+
+// Wall centrelines (XZ, relative to the anchor) of the nodes in rows r0..r1,
+// columns c0..c1 (same parity only): each node's upright wall and its two
+// slanted walls. Each wall belongs to exactly one node, so none repeats.
+std::vector<std::array<Eigen::Vector2d, 2>> reentrant_segments(
+    const ReentrantCell& cell, int r0, int r1, int c0, int c1);
+
+// Distance from p to the nearest wall surface (negative inside a wall): the XZ
+// distance to the wall centrelines minus half the wall thickness, the same at
+// every height. Exact wherever the centreline distance is below `reach`;
+// elsewhere at least reach - wall / 2. A pure function of p.
+double reentrant_wall_distance(
+    const Eigen::RowVector3d& p,
+    const ReentrantCell& cell,
+    const Eigen::RowVector3d& anchor,
+    double reach);

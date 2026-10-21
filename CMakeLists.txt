@@ -31,6 +31,7 @@ add_executable(me323
     src/lattice_struts.cpp
     src/mesh_distance.cpp
     src/fine_grid.cpp
+    src/mesh_simplify.cpp
 )
 
 target_link_libraries(me323

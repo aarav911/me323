@@ -1,10 +1,14 @@
 #include "fine_grid.h"
 
+#include "mesh_simplify.h"
+
 #include <Eigen/Geometry>
+#include <igl/default_num_threads.h>
 #include <igl/parallel_for.h>
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -22,10 +26,65 @@ struct BlockMesh
 {
     std::vector<Eigen::RowVector3d> vertices;
     std::vector<std::uint64_t> shared_key;   // not_shared, or the global key
+    std::vector<char> at_sample;             // made at a sample exactly at the isovalue
     std::vector<Eigen::Vector3i> faces;      // local vertex indices
     std::size_t samples = 0;
     std::size_t negative = 0;
+    SimplifyResult simplify;                 // outcome, when simplification was asked for
 };
+
+// Simplifies a block's piece in place (see mesh_blocks()). Locked: every
+// vertex shared with another block, and every exact-isovalue sample vertex
+// (where two sheets can touch at a point).
+void simplify_piece(BlockMesh& piece, double tolerance, const FineGrid& grid, const FineBlock& block)
+{
+    // The block's own box: the piece must stay inside it (see mesh_simplify.h).
+    const Eigen::RowVector3d box_min = grid.point(block.x0, block.y0, block.z0);
+    const Eigen::RowVector3d box_max =
+        grid.point(block.x0 + block.sx - 1, block.y0 + block.sy - 1, block.z0 + block.sz - 1);
+    const Eigen::Index n = static_cast<Eigen::Index>(piece.vertices.size());
+    Eigen::MatrixXd V(n, 3);
+    std::vector<char> locked(piece.vertices.size(), 0);
+    for (Eigen::Index v = 0; v < n; ++v)
+    {
+        V.row(v) = piece.vertices[static_cast<std::size_t>(v)];
+        locked[static_cast<std::size_t>(v)] =
+            (piece.shared_key[static_cast<std::size_t>(v)] != not_shared ||
+             piece.at_sample[static_cast<std::size_t>(v)]) ? 1 : 0;
+    }
+    Eigen::MatrixXi F(static_cast<Eigen::Index>(piece.faces.size()), 3);
+    for (std::size_t f = 0; f < piece.faces.size(); ++f)
+    {
+        F.row(static_cast<Eigen::Index>(f)) = piece.faces[f].transpose();
+    }
+    Eigen::MatrixXd U;
+    Eigen::MatrixXi G;
+    Eigen::VectorXi I;
+    piece.simplify = simplify_mesh(V, F, locked, tolerance, U, G, I, &box_min, &box_max);
+    if (piece.simplify.outcome != SimplifyOutcome::Simplified)
+    {
+        return;
+    }
+    std::vector<Eigen::RowVector3d> vertices(static_cast<std::size_t>(U.rows()));
+    std::vector<std::uint64_t> keys(static_cast<std::size_t>(U.rows()));
+    std::vector<char> at_sample(static_cast<std::size_t>(U.rows()));
+    for (Eigen::Index u = 0; u < U.rows(); ++u)
+    {
+        const std::size_t origin = static_cast<std::size_t>(I(u));
+        vertices[static_cast<std::size_t>(u)] = U.row(u);
+        keys[static_cast<std::size_t>(u)] = piece.shared_key[origin];
+        at_sample[static_cast<std::size_t>(u)] = piece.at_sample[origin];
+    }
+    std::vector<Eigen::Vector3i> faces(static_cast<std::size_t>(G.rows()));
+    for (Eigen::Index f = 0; f < G.rows(); ++f)
+    {
+        faces[static_cast<std::size_t>(f)] = G.row(f).transpose();
+    }
+    piece.vertices = std::move(vertices);
+    piece.shared_key = std::move(keys);
+    piece.at_sample = std::move(at_sample);
+    piece.faces = std::move(faces);
+}
 
 void orient_triangle(
     Eigen::Vector3i& triangle,
@@ -45,12 +104,15 @@ void orient_triangle(
 // Marching tetrahedra on one block: the original algorithm, with samples
 // addressed by their global index (for vertex keys and positions) and their
 // value read from the block's own array.
+// end_margin > 0 (printable output): no crossing closer than that fraction
+// of an edge to either end of it (see mesh_blocks()).
 void march_block(
     const FineGrid& grid,
     const FineBlock& block,
     const std::vector<double>& field,
     double isovalue,
-    BlockMesh& out)
+    BlockMesh& out,
+    double end_margin)
 {
     constexpr int cube_offsets[8][3] = {
         {0, 0, 0}, {1, 0, 0}, {1, 1, 0}, {0, 1, 0},
@@ -97,6 +159,7 @@ void march_block(
         {
             out.vertices.push_back(p);
             out.shared_key.push_back(shared ? key : not_shared);
+            out.at_sample.push_back((key & sample_flag) != 0 ? 1 : 0);
         }
         return it->second;
     };
@@ -128,7 +191,12 @@ void march_block(
         const bool shared = edge_shared(a, b);
         const Corner& from = (shared && b.global < a.global) ? b : a;
         const Corner& to = (&from == &a) ? b : a;
-        const double t = (isovalue - field[from.local]) / (field[to.local] - field[from.local]);
+        double t = (isovalue - field[from.local]) / (field[to.local] - field[from.local]);
+        if (end_margin > 0.0)
+        {
+            // Symmetric, so it gives the same point whichever end it starts from.
+            t = std::clamp(t, end_margin, 1.0 - end_margin);
+        }
         return add_vertex(key, shared, position(from) + t * (position(to) - position(from)));
     };
     const auto append_oriented = [&](int a, int b, int c,
@@ -333,14 +401,60 @@ bool mesh_blocks(
     Eigen::MatrixXd& vertices,
     Eigen::MatrixXi& faces,
     MeshStatistics& statistics,
-    std::string& error)
+    std::string& error,
+    double simplify_tolerance)
 {
+    if (!(simplify_tolerance >= 0.0) || !std::isfinite(simplify_tolerance))
+    {
+        error = "Internal: invalid simplification tolerance.";
+        return false;
+    }
     std::vector<BlockMesh> pieces(blocks.size());
-    igl::parallel_for(blocks.size(), [&](const std::size_t b)
+    // Blocks differ a lot in work (the lattice ones most), and they lie in
+    // runs, so instead of one fixed range per thread (igl::parallel_for's
+    // split) each worker takes the next block left until none are. Each
+    // block's result depends only on the block, and the merge below goes in
+    // block order, so the output is the same whichever thread did what.
+    std::atomic<std::size_t> next_block{0};
+    const std::size_t workers = std::max<std::size_t>(1, igl::default_num_threads());
+    const auto mesh_one = [&](const std::size_t b)
     {
         std::vector<double> values(blocks[b].sample_count());
         field(blocks[b], values);
-        march_block(grid, blocks[b], values, isovalue, pieces[b]);
+        if (simplify_tolerance > 0.0)
+        {
+            // Printable output: no sample within `guard` of the isovalue (no
+            // vertex exactly at a sample, where sheets can meet at a point),
+            // and below no crossing within 0.1% of an edge of either end. A
+            // crossing very near a sample (a value close to the isovalue, or
+            // an edge across one of the field's jumps such as the coverage
+            // cut) lies nanometres from the crossings on the sample's other
+            // edges, and a 32-bit STL then merges those vertices (folded,
+            // non-manifold triangles). Both depend only on the samples, so
+            // neighbouring blocks still agree.
+            const double guard = 1e-3 * grid.spacing;
+            for (double& value : values)
+            {
+                const double offset = value - isovalue;
+                if (std::abs(offset) < guard)
+                {
+                    value = isovalue + (offset < 0.0 ? -guard : guard);
+                }
+            }
+        }
+        march_block(grid, blocks[b], values, isovalue, pieces[b],
+                    simplify_tolerance > 0.0 ? 1e-3 : 0.0);
+        if (simplify_tolerance > 0.0 && !pieces[b].faces.empty())
+        {
+            simplify_piece(pieces[b], simplify_tolerance, grid, blocks[b]);
+        }
+    };
+    igl::parallel_for(std::min(workers, blocks.size()), [&](const std::size_t)
+    {
+        for (std::size_t b = next_block++; b < blocks.size(); b = next_block++)
+        {
+            mesh_one(b);
+        }
     }, 1);
 
     // Merge in block order. A shared vertex made by two blocks must come out
@@ -355,6 +469,15 @@ bool mesh_blocks(
         face_total += piece.faces.size();
         statistics.samples += piece.samples;
         statistics.negative_samples += piece.negative;
+        if (simplify_tolerance > 0.0 && !piece.faces.empty())
+        {
+            const SimplifyOutcome outcome = piece.simplify.outcome;
+            statistics.simplified_pieces += outcome == SimplifyOutcome::Simplified;
+            statistics.small_pieces += outcome == SimplifyOutcome::TooSmall;
+            statistics.refused_pieces += outcome == SimplifyOutcome::Refused;
+            statistics.faces_before += piece.simplify.faces_before;
+            statistics.faces_after += piece.faces.size();
+        }
     }
     std::vector<Eigen::RowVector3d> merged;
     merged.reserve(vertex_total);
@@ -362,7 +485,7 @@ bool mesh_blocks(
     merged_faces.reserve(face_total);
     std::unordered_map<std::uint64_t, int> shared;
     std::size_t mismatches = 0;
-    for (const BlockMesh& piece : pieces)
+    for (BlockMesh& piece : pieces)
     {
         std::vector<int> map(piece.vertices.size());
         for (std::size_t v = 0; v < piece.vertices.size(); ++v)
@@ -391,6 +514,7 @@ bool mesh_blocks(
                                       map[static_cast<std::size_t>(f[1])],
                                       map[static_cast<std::size_t>(f[2])]);
         }
+        piece = BlockMesh{};    // merged: free it now, not at the end
     }
     if (mismatches > 0)
     {

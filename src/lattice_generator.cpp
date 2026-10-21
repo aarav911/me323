@@ -144,6 +144,21 @@ bool compute_unsigned_distance(
     return true;
 }
 
+void log_simplification(const MeshStatistics& statistics, double tolerance)
+{
+    if (!(tolerance > 0.0))
+    {
+        return;
+    }
+    const double kept = statistics.faces_before > 0
+        ? 100.0 * static_cast<double>(statistics.faces_after) / statistics.faces_before : 100.0;
+    std::cout << "  simplified to within " << tolerance << ": " << statistics.faces_before
+              << " -> " << statistics.faces_after << " triangles (" << fixed1(kept)
+              << "% kept); pieces simplified " << statistics.simplified_pieces
+              << ", too small " << statistics.small_pieces << ", refused (left as extracted) "
+              << statistics.refused_pieces << ".\n";
+}
+
 // What the fine surface needs from the coarse pass.
 struct FineContext
 {
@@ -166,6 +181,7 @@ struct FineContext
     Eigen::RowVector3d head_max;
     Eigen::RowVector3d grid_last;
     LatticeType lattice_type;
+    const ReentrantCell* reentrant;              // null: the lattice is the original auxetic or the gyroid
     double cell_size;
     Eigen::RowVector3d lattice_anchor;
     double shell_thickness;
@@ -313,7 +329,8 @@ bool generate_fine_surface(const FineContext& c, GeneratedMesh& output, std::str
     std::vector<std::array<long, 6>> strut_range;   // low x, y, z, high x, y, z
     const double radius = auxetic_strut_radius(c.cell_size);
     const double pad = radius + 2.0 * fine.spacing;
-    if (c.lattice_type == LatticeType::Auxetic)
+    const bool original_auxetic = c.lattice_type == LatticeType::Auxetic && c.reentrant == nullptr;
+    if (original_auxetic)
     {
         struts = auxetic_struts(grid.minimum, c.grid_last, c.cell_size, c.lattice_anchor);
         strut_range.reserve(struts.size());
@@ -333,13 +350,19 @@ bool generate_fine_surface(const FineContext& c, GeneratedMesh& output, std::str
         }
     }
 
+    // Walls: exact within this centreline distance, at least reach - wall/2
+    // beyond. That is more than a tetrahedron edge (sqrt 3 spacing) outside any
+    // wall, so an edge never joins an inside sample to a capped one.
+    const double wall_reach = c.reentrant != nullptr
+        ? 0.5 * c.reentrant->wall_thickness + 3.0 * fine.spacing : 0.0;
+
     std::atomic<std::size_t> exact_shell{0};
     std::atomic<std::size_t> exact_swept{0};
     std::atomic<std::size_t> lattice_points{0};
     const BlockField field = [&](const FineBlock& block, std::vector<double>& values)
     {
         std::vector<double> lattice(block.sample_count(), std::numeric_limits<double>::infinity());
-        if (c.lattice_type == LatticeType::Auxetic)
+        if (original_auxetic)
         {
             SampleBox box;
             box.origin = fine.minimum;
@@ -379,7 +402,12 @@ bool generate_fine_surface(const FineContext& c, GeneratedMesh& output, std::str
                     const unsigned gz = block.z0 + k;
                     const Eigen::RowVector3d p = fine.point(gx, gy, gz);
                     const std::size_t local = block.local(i, j, k);
-                    if (c.lattice_type == LatticeType::Gyroid)
+                    if (c.reentrant != nullptr)
+                    {
+                        lattice[local] = reentrant_wall_distance(
+                            p, *c.reentrant, c.lattice_anchor, wall_reach);
+                    }
+                    else if (c.lattice_type == LatticeType::Gyroid)
                     {
                         lattice[local] = gyroid_distance(p, c.cell_size, c.lattice_anchor);
                     }
@@ -470,10 +498,11 @@ bool generate_fine_surface(const FineContext& c, GeneratedMesh& output, std::str
     const double isovalue = fine.spacing * 0.05;
     MeshStatistics statistics;
     if (!mesh_blocks(fine, blocks, field, isovalue, output.vertices, output.faces,
-                     statistics, error))
+                     statistics, error, c.options.simplify_tolerance))
     {
         return false;
     }
+    log_simplification(statistics, c.options.simplify_tolerance);
     const double seconds =
         std::chrono::duration<double>(clock::now() - start).count();
     // Counted per block: a sample on a face between blocks counts in each.
@@ -540,6 +569,24 @@ bool generate_final_helmet(
         options.fine_block_cells < 1 || options.fine_block_cells > 64)
     {
         error = "Invalid fine-grid options.";
+        return false;
+    }
+    const bool reentrant = options.auxetic_cell == AuxeticCell::Reentrant;
+    if (!std::isfinite(options.simplify_tolerance) || options.simplify_tolerance < 0.0 ||
+        !std::isfinite(options.line_width) || options.line_width < 0.0)
+    {
+        error = "Invalid simplification tolerance or line width.";
+        return false;
+    }
+    if (reentrant && lattice_type != LatticeType::Auxetic)
+    {
+        error = "The re-entrant cell is an auxetic lattice: use it with --lattice auxetic.";
+        return false;
+    }
+    if (reentrant && !fine)
+    {
+        error = "The re-entrant cell's walls are thinner than the coarse grid can draw: "
+                "give --fine-spacing as well.";
         return false;
     }
     if (head_vertices.rows() == 0 || head_faces.rows() == 0 ||
@@ -633,6 +680,66 @@ bool generate_final_helmet(
         surface_grid.k = 1;
     }
     const double surface_spacing = surface_grid.spacing;
+
+    // The re-entrant cell, checked before any heavy work.
+    ReentrantCell cell;
+    if (reentrant)
+    {
+        if (!make_reentrant_cell(options.cell_width, options.cell_angle_degrees,
+                                 options.cell_h_ratio, options.wall_thickness, cell, error))
+        {
+            return false;
+        }
+        // Sizes are in the head file's units. A width outside 1-30% of the head
+        // height means the units are not what the numbers assume (a head in mm
+        // with defaults in metres, say).
+        const double relative = cell.width / head_height;
+        if (relative < 0.01 || relative > 0.30)
+        {
+            error = "The cell width " + std::to_string(cell.width) + " is " +
+                fixed1(100.0 * relative) + "% of the head height; expected 1-30%. Check "
+                "the units (sizes are in the head file's units, metres for our scan).";
+            return false;
+        }
+        // The walls are vertical, so a tetrahedron edge spans at most sqrt 2
+        // grid steps across one. Walls thinner than that can be stepped over
+        // (holes); up to twice that they come out slightly thin in places.
+        const double no_holes = cell.wall_thickness / std::sqrt(2.0);
+        const double exact = cell.wall_thickness / (2.0 * std::sqrt(2.0));
+        if (!(surface_spacing <= no_holes / 1.1))
+        {
+            error = "The surface grid spacing " + std::to_string(surface_spacing) +
+                " is too coarse for walls " + std::to_string(cell.wall_thickness) +
+                " thick (needs at most " + std::to_string(no_holes / 1.1) +
+                ", or the walls get holes); use a smaller --fine-spacing.";
+            return false;
+        }
+        if (options.simplify_tolerance > 0.25 * cell.wall_thickness)
+        {
+            error = "The simplification tolerance must be at most a quarter of the wall thickness.";
+            return false;
+        }
+        if (surface_spacing > exact)
+        {
+            std::cout << "  NOTE: surface grid " << surface_spacing << " is coarser than "
+                      << exact << " (wall / 2 sqrt 2): walls come out slightly thin in places.\n";
+        }
+        if (options.line_width > 0.0)
+        {
+            const double lines = cell.wall_thickness / options.line_width;
+            if (std::abs(lines - std::round(lines)) > 0.05 || std::round(lines) < 1.0)
+            {
+                std::cout << "  WARNING: the wall (" << cell.wall_thickness << ") is "
+                          << lines << " line widths (" << options.line_width
+                          << "): not a whole number, so the slicer will under- or over-fill it.\n";
+            }
+        }
+    }
+    if (options.simplify_tolerance > surface_spacing)
+    {
+        error = "The simplification tolerance must not exceed the surface grid spacing.";
+        return false;
+    }
 
     std::cout << "Generating "
               << (lattice_type == LatticeType::Auxetic ? "auxetic" : "gyroid TPMS")
@@ -786,12 +893,14 @@ bool generate_final_helmet(
 
     // How much room the fit leaves for lattice, for comparing fits (zoom vs
     // stretch). Report only: nothing below depends on it.
+    double room_min = -1.0;
     {
         const double reserved = head_clearance + liner_thickness + shell_inward;
         LatticeRoom room;
         if (lattice_room(cavity, head_vertices, head_faces, reserved,
                          lattice_room_target, room, error))
         {
+            room_min = room.min;
             std::cout << "Room for lattice (along rays from the head centre, over "
                          "the covered, scanned directions; head-to-shell distance "
                          "minus " << reserved << " for air, liner and the shell's inward part):\n"
@@ -1037,15 +1146,41 @@ bool generate_final_helmet(
     output.cell_size = std::min(head_height / 9.0, maximum_gap_half_width * 1.5);
     const Eigen::RowVector3d lattice_anchor = combined_min;
     std::cout << "Maximum sampled gap half-width: "
-              << maximum_gap_half_width << " (model units).\n"
-              << "Lattice unit-cell pitch: " << output.cell_size
-              << " (anchored to the combined model bounds).\n";
+              << maximum_gap_half_width << " (model units).\n";
+    if (reentrant)
+    {
+        output.cell_size = cell.width;
+        double nu_x = 0.0;
+        double nu_z = 0.0;
+        reentrant_ideal_poisson(cell, nu_x, nu_z);
+        std::cout << "Lattice: re-entrant honeycomb walls (vertical, extruded along Y), angle "
+                  << cell.angle_degrees << " deg, h/l " << cell.h_ratio << ": l " << cell.l
+                  << ", h " << cell.h << "; repeat " << cell.width << " across X x "
+                  << 2.0 * cell.dz << " along Z (rows " << cell.dz << " apart); walls "
+                  << cell.wall_thickness << ", clear gap " << cell.clear_gap
+                  << " (model units; anchored to the combined model bounds).\n"
+                  << "  ideal (thin-wall) Poisson's ratio: " << nu_x << " squeezed along X, "
+                  << nu_z << " along Z; for these walls run analysis_tools/poisson_frame.py "
+                     "--cell-width/--cell-angle/--wall-thickness (in mm).\n";
+        if (room_min > 0.0)
+        {
+            std::cout << "  through the thinnest room (" << room_min << "): about "
+                      << room_min / cell.dz << " rows along Z, " << room_min / cell.dx
+                      << " columns along X.\n";
+        }
+    }
+    else
+    {
+        std::cout << "Lattice unit-cell pitch: " << output.cell_size
+                  << " (anchored to the combined model bounds).\n";
+    }
     if (fine)
     {
         const FineContext context{
             grid, surface_grid, options, head_vertices, head_faces, helmet_vertices,
             helmet_faces, cavity, lift, head_distance, shell_field, swept, swept_computed,
             inside_helmet, covered_near, head_min, head_max, grid_last, lattice_type,
+            reentrant ? &cell : nullptr,
             output.cell_size, lattice_anchor, shell_thickness, wall_skin,
             liner_center_distance, liner_thickness, head_clearance, cavity_margin};
         return generate_fine_surface(context, output, error);
@@ -1133,10 +1268,12 @@ bool generate_final_helmet(
                 std::copy(final_distance.data(),
                           final_distance.data() + final_distance.size(), values.begin());
             },
-            isovalue, output.vertices, output.faces, statistics, error))
+            isovalue, output.vertices, output.faces, statistics, error,
+            options.simplify_tolerance))
     {
         return false;
     }
+    log_simplification(statistics, options.simplify_tolerance);
     if (output.vertices.rows() == 0 || output.faces.rows() == 0 ||
         !output.vertices.allFinite())
     {
