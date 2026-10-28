@@ -1,1036 +1,295 @@
-# ME323 --- Helmet Lattice / Metamaterial Generator
+# ME323 auxetic helmet generator
 
-## Project Overview
+ME323 course project, IIT Bombay. This program takes a **3D scan of one person's head** and a
+**stock helmet shell** (a bike helmet from GrabCAD), and fills the gap between them with an
+**auxetic re-entrant honeycomb**: a lattice with a negative Poisson's ratio, which pulls material
+in toward an impact instead of pushing it away. The output is one closed, printable STL.
 
-This project is a C++ computational-geometry pipeline for designing a
-**3D lattice/metamaterial structure between a human head and a helmet**.
+| | |
+|---|---|
+| Lattice | re-entrant honeycomb walls: θ = −35°, 10 × 14.28 mm repeat, 1.2 mm walls; modelled ν ≈ −0.87 / −0.80 (the original cell: −0.02) |
+| Padding | 21.5–38 mm between head and shell (median 30 mm) |
+| Mesh | 5.65 M triangles, closed, no self-intersections, within 0.05 mm of the exact surface |
+| Run time | about 11 minutes, 2.3 GB of memory (Apple M4 Pro) |
 
-The intended workflow is:
+Branch `vt/main` holds the working pipeline. The first three commits are Aarav Jayalwal's original
+generator; the rest build on it (see [History](#history)).
 
-``` text
-Head STL ───────┐
-                │
-                ▼
-          Geometry processing
-                │
-                ▼
-       Define the gap / volume
-                │
-                ▼
-        Generate lattice structure
-                │
-                ▼
-       Combine / trim / validate
-                │
-                ▼
-          Printable STL
-                ▲
-                │
-Helmet STL ─────┘
+---
+
+## Contents
+
+1. [How it works, in one page](#how-it-works-in-one-page)
+2. [Repository map](#repository-map)
+3. [Source files](#source-files)
+4. [How a run flows through the code](#how-a-run-flows-through-the-code)
+5. [Build](#build)
+6. [Run](#run)
+7. [Check an output](#check-an-output)
+8. [What is not in this repository](#what-is-not-in-this-repository)
+9. [History](#history)
+10. [Credits](#credits)
+
+---
+
+## How it works, in one page
+
+Every part of the helmet is a **signed distance field**: a number at every point of space,
+negative inside the part, zero on its surface, positive outside. Parts are combined with
+`min` (union: inside either) and `max` (intersection: inside both), so the whole helmet is one
+field:
+
+```
+helmet = min( shell, liner, max( walls, inside_shell, clear_of_head ) )
 ```
 
-The immediate goal is to establish a reliable geometry-processing
-environment and correctly load, inspect, scale, and align the input STL
-meshes. Lattice generation and manufacturing/export operations will be
-built on top of this foundation.
+i.e. the shell, plus the liner, plus the honeycomb walls *only where* they are inside the shell
+*and* clear of the head's path. The helmet's surface is wherever this field is zero.
 
-------------------------------------------------------------------------
+1. **Fit the shell.** The stock helmet is stretched along its own axes, tilted and shifted
+   so there is at least 20 mm of room for padding everywhere (`helmet_fit`, `fit_config`).
+2. **Inside the shell.** Looking out from the head's centre, the distance to the shell's inner
+   face is recorded for every direction (a radius map); vents are bridged by a smooth fill,
+   the bottom opening is left open (`helmet_cavity`).
+3. **Only where the head was scanned.** The scan is closed underneath by a "lid" that is not
+   real head; directions that only see the lid get no padding (`head_lid`).
+4. **It can be put on.** The program tries 95 straight lift-off directions, picks the one the
+   head can slide out along, and keeps the head's whole swept path empty (`donning`).
+5. **The honeycomb.** Re-entrant walls drawn in the horizontal plane and extruded straight up,
+   rows offset by half a cell so the slanted walls fold like hinges (`lattice_struts`).
+6. **Surface and mesh.** The field is sampled on a 0.37 mm grid, only in blocks a surface can
+   pass through, turned into triangles by marching tetrahedra, and simplified to within
+   0.05 mm (`fine_grid`, `mesh_distance`, `mesh_simplify`).
+7. **Print file.** Loose fragments are removed, and a print copy is written in millimetres,
+   turned crown-down and set on the bed (`mesh_components`, `print_export`).
+8. **Independent check.** A separate Python checker, built on a different library, verifies
+   nothing is outside the helmet, the head can lift off, the shell is whole and the fit passes
+   its gate (`tools/check_output.py`).
 
-## Core Problem
+---
 
-Given:
+## Repository map
 
--   a **head surface mesh**
--   a **helmet surface mesh**
-
-we want to determine the usable 3D region between them.
-
-That region will eventually become the domain in which a
-lattice/metamaterial structure is generated.
-
-Conceptually:
-
-``` text
-             OUTER HELMET
-        ┌─────────────────────┐
-       /                       \
-      /     LATTICE REGION      \
-     |      ┌─────────────┐     |
-     |      │    HEAD     │     |
-     |      └─────────────┘     |
-      \                         /
-       └───────────────────────┘
 ```
-
-The important distinction is that the project is **not simply a mesh
-viewer**. The viewer is an early development tool that lets us verify
-the geometry before performing computationally expensive operations.
-
-------------------------------------------------------------------------
-
-# Technology Stack
-
-## C++20
-
-The core application is written in **C++20**.
-
-### Why C++?
-
-The eventual workload involves:
-
--   large triangle meshes
--   spatial queries
--   collision/intersection tests
--   distance calculations
--   mesh generation
--   geometric transformations
--   potentially millions of lattice elements
-
-C++ gives us:
-
--   high performance
--   direct memory control
--   mature computational-geometry libraries
--   strong numerical libraries
--   a large ecosystem for mesh processing
-
-C++ is therefore being used as the primary implementation language
-rather than Python.
-
-------------------------------------------------------------------------
-
-# CMake
-
-The project uses **CMake** as its build system.
-
-Example build:
-
-``` bash
-cmake -S . -B build -G Ninja
-cmake --build build
-```
-
-### Why CMake?
-
-The project depends on several C++ libraries. CMake gives us a standard
-way to:
-
--   locate installed libraries
--   configure compiler settings
--   manage targets
--   link dependencies
--   build the project consistently
-
-It also makes the project easier to move to another machine later.
-
-------------------------------------------------------------------------
-
-# Ninja
-
-**Ninja** is used as the CMake generator.
-
-``` bash
--G Ninja
-```
-
-### Why Ninja?
-
-Ninja is a fast build system designed for incremental compilation.
-
-This becomes useful as the project grows from a single source file into
-multiple geometry-processing modules.
-
-For example:
-
-``` text
-src/
-├── main.cpp
-├── geometry.cpp
-├── alignment.cpp
-├── lattice.cpp
-├── mesh_utils.cpp
-└── export.cpp
-```
-
-After changing one file, Ninja can rebuild only what is necessary.
-
-------------------------------------------------------------------------
-
-# Eigen
-
-The project uses **Eigen** for linear algebra.
-
-Current installed version:
-
-``` text
-Eigen 3.4.0
-```
-
-Eigen provides data structures such as:
-
-``` cpp
-Eigen::Vector3d
-Eigen::MatrixXd
-Eigen::MatrixXi
-```
-
-These are particularly useful for representing mesh data.
-
-A triangular mesh is commonly represented as:
-
-``` text
-V = vertex coordinates
-F = triangle connectivity
-```
-
-For example:
-
-``` cpp
-Eigen::MatrixXd V;
-Eigen::MatrixXi F;
-```
-
-where:
-
--   `V` contains the 3D coordinates of vertices
--   `F` specifies which vertices form each triangle
-
-### Why Eigen?
-
-The project will require substantial numerical computation:
-
--   vectors
--   matrices
--   transformations
--   rotations
--   coordinate systems
--   bounding boxes
--   distances
--   transformations of large sets of points
-
-Eigen provides these operations efficiently and integrates naturally
-with libigl.
-
-------------------------------------------------------------------------
-
-# CGAL
-
-The project uses **CGAL --- Computational Geometry Algorithms Library**.
-
-Current installed version:
-
-``` text
-CGAL 6.1.1
-```
-
-CGAL is intended to provide the project's more advanced
-computational-geometry capabilities.
-
-Potential uses include:
-
--   spatial data structures
--   geometric predicates
--   intersections
--   point/mesh queries
--   distance calculations
--   mesh operations
--   robust geometric algorithms
-
-### Why CGAL?
-
-The central difficulty of this project is ultimately geometric rather
-than graphical.
-
-We need to reason about questions such as:
-
-> Is this point inside the helmet/head region?
-
-> What is the distance from this point to a surface?
-
-> Where do these surfaces intersect?
-
-> What volume exists between two surfaces?
-
-> Does this lattice element remain inside the desired domain?
-
-These operations benefit from a mature computational-geometry library
-rather than implementing everything from scratch.
-
-CGAL therefore forms an important part of the computational foundation.
-
-------------------------------------------------------------------------
-
-# libigl
-
-The project uses **libigl** for mesh processing and visualization.
-
-The current project obtains libigl through CMake `FetchContent`.
-
-The project currently uses:
-
-``` text
-libigl
-├── igl::core
-├── igl::opengl
-└── igl::glfw
-```
-
-### Why libigl?
-
-libigl is particularly convenient for working with triangle meshes
-represented as:
-
-``` text
-V + F
-```
-
-It provides a large collection of mesh-processing algorithms and
-utilities without requiring a heavyweight mesh class abstraction.
-
-For this project, libigl is useful for:
-
--   loading STL meshes
--   representing meshes
--   mesh processing
--   visualization
--   debugging geometry
-
-It also integrates naturally with Eigen.
-
-------------------------------------------------------------------------
-
-# GLFW / OpenGL
-
-libigl's interactive viewer uses **GLFW** and **OpenGL**.
-
-The current application can launch an interactive 3D viewer from C++:
-
-``` cpp
-igl::opengl::glfw::Viewer viewer;
-
-viewer.launch();
-```
-
-### Why have a viewer?
-
-The viewer is primarily a **development and debugging tool**.
-
-Before performing complicated geometry operations, we need to be able to
-visually inspect:
-
--   mesh orientation
--   scale
--   positioning
--   alignment
--   surface quality
--   intersections
--   generated lattice structures
-
-A numerical algorithm can technically succeed while operating on
-completely misaligned geometry.
-
-Being able to immediately see the meshes is therefore extremely
-valuable.
-
-------------------------------------------------------------------------
-
-# STL
-
-STL is being used as the primary **input/output interchange format**.
-
-Current input files:
-
-``` text
-data/
-├── head.stl
-└── helmet.stl
-```
-
-STL is convenient because it is widely supported by:
-
--   CAD software
--   3D scanners
--   mesh-processing software
--   3D-printing software
--   slicing software
-
-However, STL is **not intended to be the internal representation** of
-the geometry.
-
-Internally, meshes are converted into:
-
-``` text
-V — vertex coordinates
-F — triangle connectivity
-```
-
-This makes numerical and geometric operations much easier.
-
-------------------------------------------------------------------------
-
-# Current Project Structure
-
-The project currently follows this structure:
-
-``` text
-me323/
-│
-├── CMakeLists.txt
-│
+.
+├── README.md                 this file
+├── CMakeLists.txt            build: C++20, libigl v2.6.4 (with Eigen, GLFW, ImGui) fetched automatically
+├── src/                      the generator (C++), see "Source files" below
+│   ├── main.cpp              entry point: command line, fit, viewer, writes the output files
+│   ├── fit_config.*          how the stock helmet is placed around the head; reads/writes fit_config.txt
+│   ├── helmet_fit.*          the stretch fit, and the "room for lattice" report
+│   ├── head_lid.*            which triangles of the head scan are the lid (from the STL header)
+│   ├── helmet_cavity.*       "inside the shell": the radius map seen from the head's centre
+│   ├── donning.*             the lift-off direction and the swept head (so it can be put on)
+│   ├── lattice_generator.*   builds the helmet: all the distance fields, combined and meshed
+│   ├── lattice_struts.*      the lattice cells as geometry: re-entrant walls, original strut cell, gyroid
+│   ├── mesh_distance.*       fast distances to a triangle mesh (search trees built once)
+│   ├── fine_grid.*           block-wise fine sampling grid + marching tetrahedra
+│   ├── mesh_simplify.*       simplification with a guaranteed error bound and no self-intersections
+│   ├── mesh_components.*     splits the mesh into pieces; removes loose fragments, keeps air pockets
+│   ├── print_export.*        the print copy: mm, crown-down, on the bed
+│   └── coupon.*              small test prints of the helmet's walls under a roof
+├── tools/
+│   └── check_output.py       independent checker (Python + Open3D), and the slice pictures
 ├── data/
-│   ├── head.stl
-│   └── helmet.stl
-│
-├── src/
-│   └── main.cpp
-│
-└── build/
+│   ├── head.stl              head mesh the program reads (here: GrabCAD's sample head, see below)
+│   └── helmet.STL            the stock GrabCAD bike helmet (thin shell with 9 vents)
+├── docs/
+│   └── DESIGN_NOTES.md       the original design notes (tool choices, first plan)
+├── Male_Head_LP.stp          GrabCAD's sample head as CAD (STEP), the source of data/head.stl
+├── 4c1d2516-b483-43be-82ae-7a436e8b1888.jpg   photo of the first hand-drawn plan
+├── notes.txt                 early project notes (the first plan, in text)
+└── build/                    an early Linux build folder, committed by mistake: not source, ignore it
 ```
 
-The `build/` directory contains generated CMake/Ninja build files and
-compiled binaries and should generally not be treated as source code.
+---
 
-As the project grows, the structure is expected to evolve toward
-something like:
+## Source files
 
-``` text
-me323/
-│
-├── CMakeLists.txt
-│
-├── README.md
-│
-├── data/
-│   ├── head.stl
-│   └── helmet.stl
-│
-├── include/
-│   ├── geometry/
-│   ├── lattice/
-│   └── visualization/
-│
-├── src/
-│   ├── main.cpp
-│   ├── geometry/
-│   ├── lattice/
-│   └── visualization/
-│
-├── tests/
-│
-└── build/
+Each `.h` file starts with a comment explaining what it does and why; that is the best place
+to read further. Grouped by job:
+
+### Entry point
+
+| File | Purpose |
+|---|---|
+| `main.cpp` | Parses the command line, loads `data/head.stl` and `data/helmet.STL`, applies the fit (zoom or stretch), runs the generator, writes the outputs. Without `--generate-only` it also opens a 3D viewer (libigl/GLFW) with a small panel to adjust the fit and save it to `fit_config.txt`. `--coupon` makes the test coupons without reading any data. |
+
+### Fitting the stock helmet
+
+| File | Purpose |
+|---|---|
+| `fit_config.h/.cpp` | The fit as data: **zoom** (Aarav's original: one scale, helmet top a fixed gap above the head) or **stretch** (separate scale per axis, a tilt and an offset). Saves and loads `fit_config.txt` (version 1 = zoom, version 2 = stretch). |
+| `helmet_fit.h/.cpp` | Applies the stretch fit to the helmet's vertices (stretch along the helmet's own axes, then tilt, then place). Also measures the room left for lattice around the head, used for the pass/fail gate. |
+
+The *search* for the best stretch fit is a separate Python study (not in this repository, see
+below); it writes the chosen numbers into `fit_config.txt`, and this program only applies them.
+
+### Defining the space to fill
+
+| File | Purpose |
+|---|---|
+| `head_lid.h/.cpp` | The scan of a head is open at the bottom, so it is closed with a "lid". The exporter records the lid's triangles in the STL header (`ME323-HEAD v1 lid-faces <first> <count>`); this file reads and checks that marker. A head without a marker is treated as a complete head. |
+| `helmet_cavity.h/.cpp` | "Inside the helmet": for every direction seen from the head's centre (0.5° steps), the distance to the shell's inner face. Vents are filled by an exact harmonic (Laplace) solve; the bottom opening stays open; directions that only see the lid are excluded. Replaces the original inside test, which filled the helmet's whole bounding box. |
+| `donning.h/.cpp` | Putting the helmet on: tries straight lift-off directions (tilted up to ±45° front–back, ±10° sideways), picks the one the head blocks least, and gives the distance to the head swept along it, so liner and lattice stay out of the head's path. |
+
+### Building the helmet
+
+| File | Purpose |
+|---|---|
+| `lattice_generator.h/.cpp` | The core. Builds the distance fields of the shell (the stock wall plus a thin skin, or the original padded band), the liner (3.7 mm against the swept head), the lattice and the cavity, combines them with min/max, and meshes the result: coarse grid (original) or the fine block grid. `GenerationOptions` holds every setting. |
+| `lattice_struts.h/.cpp` | The lattice as pure geometry, independent of any grid: the **re-entrant honeycomb** (`ReentrantCell`, `reentrant_wall_distance`: walls extruded along the helmet's up axis, pattern centred on the head's midline), the optional roof chamfer under the liner, Aarav's original strut cell and the gyroid (TPMS) sheet. |
+| `mesh_distance.h/.cpp` | Signed/unsigned distance to a triangle mesh at single points, with the search trees built once, so the fine grid can query them millions of times on many threads. |
+
+### From field to triangles
+
+| File | Purpose |
+|---|---|
+| `fine_grid.h/.cpp` | A sampling grid evaluated and meshed in blocks: only blocks a surface can pass through are sampled finely (0.37 mm), with exact distances near the surface and safe bounds elsewhere. Marching tetrahedra per block, with vertices on shared block faces matched exactly so blocks join without gaps; checks the result is closed. |
+| `mesh_simplify.h/.cpp` | Edge-collapse simplification (on libigl's engine, our own rules): every original point stays within the tolerance (0.05 mm) of the result, no collapse may flip a triangle, make a needle or make the surface cross itself, block borders stay fixed, and vertices stay far enough apart to survive saving as 32-bit STL. 118.85 M → 5.65 M triangles. |
+| `mesh_components.h/.cpp` | Splits the closed mesh into pieces; removes loose fragments (too small to print), keeps the main body and the sealed air pockets inside it (the honeycomb's closed cells), and reports anything unexpected. |
+
+### Printing
+
+| File | Purpose |
+|---|---|
+| `print_export.h/.cpp` | The copy for the slicer: converted to mm, turned crown-down by a proper rotation `(x, y, z) → (x, z, −y)` (not a mirror), lowest point on the bed, centred. Crown-down needs the least support inside the part. |
+| `coupon.h/.cpp` | Two 40 × 40 × 32.7 mm test prints with the helmet's exact walls between a floor (like the shell) and a roof (like the liner): A with a flat roof bridging the cells, B with 55° slopes under the roof. If A prints cleanly, the helmet can be printed as is; if A's roof sags, use `--roof-chamfer 55`. |
+
+### Checking
+
+| File | Purpose |
+|---|---|
+| `tools/check_output.py` | Independent checker, deliberately built on Open3D's ray tracer rather than libigl. Sorts every bit of material into shell / liner / lattice / outside and checks: nothing outside the helmet; nothing where the head was not scanned; nothing in the head's way when lifting off; the shell has no holes; the fit's gate (room ≥ 20 mm, evenness, size, coverage). Also reports volume and mass, sealed pockets, overhangs, and draws the side/front slice pictures. |
+
+---
+
+## How a run flows through the code
+
+```
+main.cpp
+ ├─ read data/head.stl (+ lid marker: head_lid) and data/helmet.STL
+ ├─ fit the helmet: zoom, or stretch from fit_config.txt (fit_config, helmet_fit)
+ └─ generate_final_helmet()                                  lattice_generator
+     ├─ inside the shell: radius map, vents bridged            helmet_cavity
+     ├─ unscanned directions removed                           helmet_cavity + head_lid
+     ├─ lift-off direction, swept head                         donning
+     ├─ fields: shell, liner, lattice walls, cavity            lattice_struts, mesh_distance
+     ├─ combine with min/max and sample                        fine_grid (or the coarse grid)
+     ├─ marching tetrahedra + simplification per block         fine_grid, mesh_simplify
+     ├─ remove loose fragments, re-check closed                mesh_components
+     └─ write final_helmet_<case>.stl and *_print.stl          print_export
 ```
 
-------------------------------------------------------------------------
+---
 
-# Current Geometry Pipeline
+## Build
 
-The current prototype performs the following operations:
+Needs CMake ≥ 3.20 and a C++20 compiler; libigl (with Eigen, GLFW and ImGui) is downloaded by
+CMake on the first configure.
 
-## 1. Load the head mesh
-
-The STL is loaded into:
-
-``` cpp
-Eigen::MatrixXd V_head;
-Eigen::MatrixXi F_head;
+```bash
+cmake -S . -B build-local -DCMAKE_BUILD_TYPE=Release -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+cmake --build build-local -j 8
 ```
 
-## 2. Load the helmet mesh
+Use a fresh build folder (the committed `build/` is a stale Linux build). With Ninja installed,
+add `-G Ninja`. The checker needs Python 3 with `numpy`, `scipy`, `open3d` and `matplotlib`.
 
-Similarly:
+---
 
-``` cpp
-Eigen::MatrixXd V_helmet;
-Eigen::MatrixXi F_helmet;
+## Run
+
+Run from the repository root, because the program reads `data/` and `fit_config.txt` from the
+working directory. Sizes on the command line are in the head file's units (metres for our scan,
+so `0.0012` = 1.2 mm).
+
+```bash
+./build-local/me323 --generate-only --export-fit     # build the helmet, no viewer
+./build-local/me323                                  # the same, then open the 3D viewer
+./build-local/me323 --coupon                         # just the two test coupons (mm)
+./build-local/me323 --classic --generate-only        # Aarav's original behaviour, for comparison
 ```
 
-## 3. Inspect bounding boxes
+**Defaults** (no flags): auxetic re-entrant honeycomb, θ −35°, 10 mm cells, 1.2 mm walls,
+0.37 mm surface grid, simplified to 0.05 mm, printable output.
 
-For each mesh we calculate:
+**Outputs** (in the working directory):
 
-``` text
-minimum XYZ
-maximum XYZ
-size
-center
+| File | What it is |
+|---|---|
+| `final_helmet_auxetic.stl` | the helmet in the model's units and orientation (used for the checks) |
+| `final_helmet_auxetic_print.stl` | **the file to print**: mm, crown-down, on the bed |
+| `fitted_head.stl`, `fitted_helmet.stl` | with `--export-fit`: the exact head and helmet the generator used (the checker needs them) |
+| `coupon_A_no_chamfer.stl`, `coupon_B_chamfer.stl` | with `--coupon`: the two test prints |
+
+**Useful flags:**
+
+| Flag | Effect |
+|---|---|
+| `--fit zoom\|stretch` | choose the fit; stretch needs a version-2 `fit_config.txt` |
+| `--lattice auxetic\|tpms` | re-entrant honeycomb (default) or a gyroid sheet |
+| `--cell original\|reentrant` | Aarav's strut cell or the re-entrant honeycomb |
+| `--cell-width`, `--cell-angle`, `--cell-h-ratio`, `--wall-thickness` | the honeycomb's size, angle (negative = re-entrant), h/l (0 = the value giving ν = −1) and wall thickness |
+| `--fine-spacing <size>` | surface grid (default 0.0004; 0 = the coarse grid only) |
+| `--simplify <tolerance>` | simplification tolerance (default 0.00005 = 0.05 mm; 0 = none) |
+| `--roof-chamfer <deg>` | 45–80°: slopes under the liner, so the roof needs no bridging |
+| `--shell wall\|band` | shell from the stock wall plus a skin (default) or the original padded band |
+| `--classic` | the original behaviour: original cell, coarse grid, no simplification |
+
+---
+
+## Check an output
+
+```bash
+python3 tools/check_output.py final_helmet_auxetic.stl fitted_head.stl fitted_helmet.stl \
+    --step3 --zone-helmet data/helmet.STL --fine-spacing 0.0004 --overhangs --density 1.24 \
+    --png slices.png
 ```
 
-This is important because STL files do not necessarily use the same
-units or coordinate system.
-
-For example, the current meshes were found to have approximately:
-
-``` text
-HEAD
-Size:
-0.255 × 0.438 × 0.265
-```
-
-while the original helmet mesh was approximately:
-
-``` text
-HELMET
-Size:
-126.8 × 111.7 × 136.9
-```
-
-This revealed a large unit/scale mismatch.
-
-## 4. Scale the helmet
-
-Rather than permanently hard-coding an arbitrary scale factor, the
-current approach derives the scale from the geometry.
-
-The basic idea is:
-
-``` text
-desired helmet height
-────────────────────── = scale
-original helmet height
-```
-
-This makes the alignment process reproducible and tunable.
-
-## 5. Align the meshes
-
-The current prototype uses bounding-box information to align:
-
--   X center
--   Z center
--   vertical position
-
-and exposes additional X/Y/Z offsets for manual adjustment.
-
-This is an initial registration method, not the final
-geometric-registration algorithm.
-
-## 6. Stretch fit (optional)
-
-One scale for all three axes cannot match a stock helmet to a particular
-head: with the Run_2 scan the top gets no room for lattice at Gap 5 mm while
-the low sides get 17 mm, and evening that out by raising Gap makes the helmet
-278 × 301 mm. The stretch fit (`src/helmet_fit.cpp`, `src/fit_config.cpp`)
-stretches the helmet along its own three axes, tilts it about the
-side-to-side axis (+ = front up), and places its box centre at the head's
-box centre plus an offset. The values are chosen by
-`analysis_tools/stretch_fit_study.py` (outside this repo; it searches for the
-most even room for lattice within agreed limits) and handed over in
-`fit_config.txt`:
-
-``` text
-ME323_FIT_CONFIG 2
-fit_mode stretch
-head_scale 1
-helmet_scale 1
-gap 0.005
-head_translation 0 0 0
-helmet_translation 0 0 0
-helmet_stretch <sx> <sy> <sz>
-helmet_pitch <degrees>
-helmet_offset <x> <y> <z>
-```
-
-Version 2 is only written in stretch mode; zoom mode still writes version 1,
-byte for byte as before, so older builds keep reading it (and refuse version 2
-rather than misreading it). `--fit zoom|stretch` overrides the file's mode, and
-the viewer has a Zoom / Stretch switch with the stretch values editable.
-`--lattice-room <size>` (model units, 0.02 = 20 mm) adds a target to the
-"Room for lattice" line the generator prints for every fit.
-
-------------------------------------------------------------------------
-
-# Why Alignment Is Its Own Problem
-
-Correct mesh alignment is critical.
-
-A lattice generated between two incorrectly registered surfaces is
-useless, even if the lattice-generation algorithm itself is
-mathematically correct.
-
-There are several possible sources of mismatch:
-
-``` text
-1. Different units
-2. Different scale
-3. Different origin
-4. Different translation
-5. Different orientation
-6. Different coordinate conventions
-```
-
-The current prototype handles scale and translation first.
-
-Rotation and more sophisticated surface-based registration can be added
-if the input meshes require it.
-
-------------------------------------------------------------------------
-
-# Planned Geometry Pipeline
-
-Once the head and helmet are correctly registered, the project can move
-toward the actual objective.
-
-## Stage 1 --- Mesh validation
-
-Verify:
-
--   watertightness where required
--   triangle orientation
--   degenerate triangles
--   self-intersections
--   coordinate system
--   units
--   mesh resolution
-
-------------------------------------------------------------------------
-
-## Stage 2 --- Define the gap region
-
-The goal is to determine the 3D region satisfying approximately:
-
-``` text
-outside head
-AND
-inside helmet
-```
-
-with appropriate clearance constraints.
-
-Conceptually:
-
-``` text
-Helmet volume
-      ∩
-Outside(head)
-      =
-Lattice domain
-```
-
-This is the central geometric problem.
-
-------------------------------------------------------------------------
-
-## Stage 3 --- Generate the lattice
-
-A lattice structure will be generated inside the available domain.
-
-The current prototype implements two implicit options in
-`src/lattice_generator.cpp`:
-
--   **Auxetic:** a re-entrant honeycomb strut network repeated through the
-    third axis.
--   **TPMS:** a gyroid sheet defined by its periodic implicit equation.
-
-Both are clipped to the space between the fitted head and the inside of the
-helmet shell. "Inside the helmet" comes from a radius map built in
-`src/helmet_cavity.cpp`: rays from the head's centre record where they first
-meet the shell's inner face; small holes in that map (vents) are bridged with a
-smooth fill so lattice continues under them, and the one large hole (the
-opening the head goes through) is left open. The shell is open, so a signed
-distance to it has no meaningful inside; an earlier version used that sign plus
-the helmet's bounding box and filled the whole box with lattice. The map needs
-the shell to be star-shaped from the head centre, and generation stops with an
-error if it is not. The input helmet surface is given a thin implicit skin, and a smooth
-head-facing liner is added so clipped struts do not end as exposed rods
-against the wearer. Both skins and the lattice are unioned into one sampled
-solid.
-
-The bottom stays open, so the helmet can be put on:
-
--   **A scanned head ends at a rim.** `sfm/export_for_me323.py` closes it with
-    a lid (a fan of triangles) and records which triangles are lid in the
-    STL's 80-byte header: `ME323-HEAD v1 lid-faces <first> <count>`
-    (`src/head_lid.cpp` reads and checks it; a head without the marker, such
-    as the GrabCAD model, is treated as complete). Directions from the head
-    centre that see only the lid get no liner or lattice, just like the
-    opening: beyond the rim lies head nobody measured. The liner used to wrap
-    the whole head, lid included, which sealed the helmet shut.
--   **The liner is cut by direction only:** it exists where the helmet covers
-    the head, vents included, however close the shell comes.
--   **The shell is the stock wall** (`--shell wall`, the default): the inside of
-    the helmet mesh, found by winding number, plus a thin skin of
-    `--shell-skin` grid cells (default 0.5) on every face so walls thinner than
-    the grid can resolve do not open up. The lattice reaches the wall's inner
-    face and fuses with the skin. The generator checks that the inside it finds
-    adds up to the mesh's own volume and stops if not (a mesh that is not a
-    closed solid): then use `--shell band`, the original, which pads every face
-    by half a skin thickness. Band roughly doubles the wall's material and
-    leaves hollows where the wall is thicker than the band; for the Run_2 stretch
-    fit, Wall cuts the shell from 1116 to 890 cm³ and removes 54 cm³ of sealed
-    pockets.
--   **It has to slide on.** `src/donning.cpp` tries straight lift-off
-    directions (tilts up to 45 degrees forward/back, 10 sideways) and picks
-    the one the head blocks least. Liner and lattice are then built against
-    the space the head sweeps through along it, instead of the head itself,
-    so the back of the skull, which curves under, cannot hook them. For the
-    Run_2 scan, lifting straight up is blocked (about 6% of where material
-    can go); about 20 degrees toward the back is clear. The shell is the
-    stock helmet and is not trimmed; the program warns if it is in the way,
-    or if it comes within the head clearance (a fit that is too tight).
-
-Unit cells are phased from the combined model bounds (not world zero),
-and the lattice pitch is reduced when the sampled gap is narrower. Marching
-cubes extracts the result and the app writes `final_helmet_auxetic.stl` or
-`final_helmet_tpms.stl` in the current working directory. The TPMS case is
-generated when the app starts; either case can be regenerated from the
-viewer. The generated STL is shown in the viewer.
-
-Run `./build/me323` to generate the printable helmet and open it (the
-defaults since step 4: the re-entrant honeycomb walls on a 0.37 mm grid,
-simplified to 0.05 mm, about 11 minutes for our scan), or
-`./build/me323 --lattice tpms` for the gyroid case. `--classic` gives back the
-original behaviour in one flag (Aarav's cell, the coarse grid, no
-simplification; flags after it still apply), e.g.
-`./build/me323 --classic --lattice auxetic`. Add `--generate-only` to export the selected case and exit without
-opening a viewer (useful for batch runs or automated checks). Add
-`--export-fit` to also write `fitted_head.stl` and `fitted_helmet.stl`, the
-exact meshes the generator received (the head keeps its lid marker).
-
-`--fine-spacing <size>` (head-file units; 0.0005 = 0.5 mm) takes the surface
-from a finer grid: the coarse grid (about head height / 120, capped at 4 M
-samples) divided k times, k the smallest whole number giving at most the
-requested spacing. Only the blocks the shell, liner or lattice surface can pass
-through are sampled, in parallel; the fit, cavity, lift-off and cell pitch stay
-on the coarse grid, and the wall skin is half a fine cell. Without the flag the
-output is exactly what it was. For the Run_2 stretch fit, 0.0005 gives a
-0.46 mm surface grid, 36.5 M triangles (a 1.83 GB STL) in about 90 s using up to
-13 GB of memory. `--fine-exact`, `--fine-all-blocks` and `--fine-block-cells <n>`
-are for testing (exact distances everywhere, no skipped blocks, block size); the
-mesh must not depend on them.
-
-`--cell reentrant` replaces the auxetic lattice with the textbook re-entrant
-honeycomb (rows offset by half a repeat) drawn in the horizontal plane and
-extruded straight up as continuous walls, which an FDM printer builds layer on
-layer without overhangs: `--cell-width` (repeat side to side, default 0.010),
-`--cell-angle` (default -35 degrees), `--cell-h-ratio` (h / l, default the value
-giving an ideal Poisson's ratio of -1), `--wall-thickness` (default 0.0012),
-`--line-width` (default 0.0004, only to warn when the wall is not a whole number
-of extrusion lines). It needs `--fine-spacing` (the walls are thinner than the
-coarse grid); the program refuses a cell whose walls would nearly touch, a grid
-too coarse for the walls, and sizes that look like the wrong units. Check a cell
-first with `analysis_tools/poisson_frame.py --cell-width 10 --cell-angle -35
---wall-thickness 1.2` (mm): Poisson's ratio both ways, stiffness, gap. It is the
-default (`--cell original` gives the original lattice, unchanged); it applies to
-the auxetic lattice only (the gyroid ignores it). The pattern is anchored on the
-head's centre, so it is mirror-symmetric left to right.
-
-`--roof-chamfer <deg>` (0 = none, default; else 45-80) puts slopes under the
-liner from every wall, so that printed crown-down the liner rests on them
-instead of bridging the cells (about 4.4 mm wide). Use it if the TPU test
-coupon shows the roof sagging (below).
-
-`--simplify <tolerance>` (e.g. 0.00005 = 0.05 mm) makes a printable mesh: each
-block is simplified as soon as it is meshed, with a guaranteed bound (every
-original point within the tolerance of the result and every new vertex within it
-of the original), no self-intersections, the blocks still matching exactly, and
-no two vertices close enough to merge in the 32-bit STL. For the Run_2 stretch fit,
-`--fine-spacing 0.0004 --cell reentrant --simplify 0.00005` (the defaults) gives
-5.9 M triangles (a 293 MB STL; unsimplified it would be about 119 M) in about 11
-minutes with 2.2 GB of memory. Printable mode also removes loose fragments (keeps
-the main body, its sealed air pockets, and any larger separate piece, with a
-warning) and writes a second file for the printer, `final_helmet_<case>_print.stl`:
-in millimetres, turned crown-down (a proper rotation, not a mirror), on the bed.
-
-Printing (FDM, TPU): load `*_print.stl` as it is (crown on the bed, walls
-vertical). Supports **on the build plate only**: the honeycomb cells are sealed,
-and support inside them could never be removed; outside, the shell's overhangs
-are reachable from the plate. Add a brim (the crown is a small contact). With a
-0.4 mm nozzle the 1.2 mm walls are 3 lines.
-
-Test coupon first: `./build/me323 --coupon` writes `coupon_A_no_chamfer.stl` and
-`coupon_B_chamfer.stl` (40 x 40 x 32.7 mm, mm, ready to print; no head needed):
-the helmet's walls between a floor and a liner-like roof, closed at the sides.
-Print both in TPU. If A's roof is flat and solid, print the helmet as it is; if
-it sags into the cells, regenerate the helmet with `--roof-chamfer 55` (B's roof
-needs no bridging).
-
-`tools/check_output.py` independently checks an output (Python with numpy,
-scipy, open3d; matplotlib for `--png`), with Open3D rather than libigl. It sorts
-the solid material into helmet skin, head-side liner, lattice inside the
-helmet, and material outside the helmet. Step 1 fails if more than 0.1% is
-outside the helmet. Step 2 fails if more than 0.1% is liner or lattice where
-the head was not scanned, liner where the helmet does not cover, or material
-the head passes through for the best straight lift-off direction. It also
-checks the shell (step 3b): rays aimed at the head from outside must meet the
-output near the stock outer face (no holes), and the middle of the stock wall
-must be solid; and it estimates the mass (`--density`, default 1.0 g/cm³).
-`--shell` / `--shell-skin` / `--fine-spacing` must match the generator's. The
-checker also prints the mesh's exact enclosed volume, and with `--overhangs` the
-area an FDM print would have to bridge or support printed crown-up or crown-down:
-
-``` bash
-./build/me323 --lattice auxetic --generate-only --export-fit
-python tools/check_output.py final_helmet_auxetic.stl fitted_head.stl fitted_helmet.stl --png slices.png
-```
-
-`--step3 --zone-helmet data/helmet.STL` adds the step-3 report: room for
-lattice measured along the head's normal over a fixed protection zone (what
-the default Gap-5 zoom fit covers), and a gate (room ≥ 20 mm, p95/p5 ≤ 1.5,
-size ≤ 245 × 280 mm, zone covered ≥ 99%, front edge not lower, shell not in the
-way). The gate counts in the exit status.
-
-This is a first printable-mesh prototype, not a validated helmet design.
-The union is voxel-resampled, so surfaces and thin features are approximate;
-the source meshes must enclose meaningful volumes for signed-distance
-inside/outside classification. Inspect the exported STL in a slicer and
-validate its wall thickness, clearances, manifoldness, and mechanical
-performance before considering manufacture or wear.
-
-Possible lattice families can later include:
-
--   cubic
--   octet
--   tetrahedral
--   gyroid
--   TPMS-based structures
--   custom unit cells
-
-The lattice should eventually be parameterized by quantities such as:
-
-``` text
-cell size
-strut thickness
-relative density
-orientation
-local stiffness
-```
-
-------------------------------------------------------------------------
-
-## Stage 4 --- Clip lattice to the available domain
-
-A generated lattice cannot simply occupy the entire bounding box.
-
-It must be constrained by the actual head/helmet geometry.
-
-The desired result is approximately:
-
-``` text
-          helmet
-       ┌───────────┐
-      /             \
-     /  lattice      \
-    |   ╔═══════╗     |
-    |   ║  head ║     |
-    |   ╚═══════╝     |
-     \               /
-      └─────────────┘
-```
-
-------------------------------------------------------------------------
-
-## Stage 5 --- Mesh processing
-
-The generated structure will need to be converted into a valid printable
-mesh.
-
-Potential operations include:
-
--   trimming
--   boolean operations
--   merging
--   remeshing
--   removing degenerate geometry
--   checking manifoldness
--   checking for self-intersections
-
-------------------------------------------------------------------------
-
-## Stage 6 --- Export
-
-The final result should be exportable as an STL suitable for downstream
-CAD/3D-printing workflows.
-
-------------------------------------------------------------------------
-
-# Design Philosophy
-
-A few architectural choices are deliberate.
-
-## Separate visualization from geometry
-
-The viewer is useful, but it should not become the core of the project.
-
-The computational pipeline should eventually be usable independently of
-the GUI:
-
-``` text
-geometry
-   ↓
-processing
-   ↓
-lattice generation
-   ↓
-mesh generation
-   ↓
-STL export
-```
-
-The viewer can then visualize intermediate results.
-
-------------------------------------------------------------------------
-
-## Keep transformations explicit
-
-Scale, rotation, and translation should be represented explicitly rather
-than hidden inside mesh-loading code.
-
-This makes it possible to reproduce a geometry-processing pipeline and
-debug it.
-
-Eventually, the transformation should be represented mathematically as
-something like:
-
-``` text
-p' = R p + t
-```
-
-where:
-
--   `R` = rotation
--   `t` = translation
-
-and scaling can be represented separately.
-
-------------------------------------------------------------------------
-
-## Use libraries for difficult primitives
-
-The project should not reimplement mature algorithms unnecessarily.
-
-The intended division of responsibility is approximately:
-
-``` text
-Eigen
-    ↓
-Linear algebra
-
-CGAL
-    ↓
-Robust computational geometry
-
-libigl
-    ↓
-Mesh processing + mesh utilities
-
-OpenGL / GLFW
-    ↓
-Visualization
-
-C++
-    ↓
-Project-specific algorithms
-```
-
-The project's own code should focus primarily on the **helmet/lattice
-problem**, rather than rebuilding generic geometry infrastructure.
-
-------------------------------------------------------------------------
-
-# Current Status
-
-The development environment is operational.
-
-Currently working:
-
--   C++20 compilation
--   CMake
--   Ninja
--   Eigen
--   CGAL
--   libigl
--   GLFW/OpenGL viewer
--   WSL graphical output
--   STL loading
--   simultaneous visualization of head and helmet meshes
--   bounding-box analysis
--   automatic initial scaling/alignment
-
-The current prototype is therefore at the **geometry-ingestion and
-registration stage**.
-
-The next major engineering problem is:
-
-> **Precisely define and compute the 3D volume between the head and
-> helmet surfaces.**
-
-That volume will become the domain for the lattice/metamaterial
-generator.
-
-------------------------------------------------------------------------
-
-# Build and Run
-
-From the project root:
-
-``` bash
-cmake -S . -B build -G Ninja
-cmake --build build
-./build/me323
-```
-
-For a clean rebuild:
-
-``` bash
-rm -rf build
-cmake -S . -B build -G Ninja
-cmake --build build
-./build/me323
-```
-
-------------------------------------------------------------------------
-
-# Long-Term Goal
-
-The eventual program should be able to accept something conceptually
-like:
-
-``` bash
-./build/me323 data/head.stl data/helmet.stl
-```
-
-and perform a pipeline resembling:
-
-``` text
-          head.stl
-              │
-              ▼
-       ┌──────────────┐
-       │ Mesh loading │
-       └──────┬───────┘
-              │
-              │
-          helmet.stl
-              │
-              ▼
-       ┌──────────────┐
-       │ Registration │
-       └──────┬───────┘
-              │
-              ▼
-       ┌──────────────┐
-       │ Gap/domain   │
-       │ computation  │
-       └──────┬───────┘
-              │
-              ▼
-       ┌──────────────┐
-       │   Lattice    │
-       │  generation  │
-       └──────┬───────┘
-              │
-              ▼
-       ┌──────────────┐
-       │ Mesh cleanup │
-       │ & validation │
-       └──────┬───────┘
-              │
-              ▼
-       ┌──────────────┐
-       │   STL export │
-       └──────────────┘
-```
-
-The final objective is a **parameterized, computationally generated
-helmet metamaterial/lattice structure**, rather than a manually modeled
-mesh.
+It prints a PASS/FAIL line per check and exits with status 0 only if all pass. `--density` is
+the filament's density in g/cm³ for the mass estimate (1.24 PLA, 1.21 TPU). The slice picture
+colours shell, liner and lattice, and marks any failure in red, purple or pink.
+
+For the final helmet: material outside the helmet under 0.005% (the original code: 51%),
+nothing in unscanned directions or in the head's way, shell whole, gate passed (room ≥ 20 mm,
+p95/p5 ≤ 1.5, size ≤ 245 × 280 mm, coverage ≥ 99%).
+
+---
+
+## What is not in this repository
+
+- **The head scan.** `data/head.stl` here is GrabCAD's sample head, as originally committed.
+  Our results use a scan of a real person, which is kept out of the repository on purpose. To use your own scan, replace `data/head.stl` with a closed head mesh whose lid is
+  marked in the STL header (see `head_lid.h`); without a marker the head is taken as complete.
+- **The fit for our scan.** `fit_config.txt` (version 2, stretch) comes from the fit study
+  and is not committed. Without it the program uses the zoom fit.
+- **The scan pipeline** (Python: video frames → structure-from-motion with pycolmap → smooth
+  head surface → lidded STL), the **stretch-fit search**, the **beam model** that gives the
+  Poisson's ratios, the unit tests and the generated STLs (about 280 MB each) are kept in the
+  project folder outside this repository; they are available on request.
+
+---
+
+## History
+
+| Commit | Change |
+|---|---|
+| `e9f2b65`, `ecac326`, `0e578fa` | Aarav: first version — helmet fit (zoom), lattice generation (strut cell, gyroid), viewer |
+| `731a8ea` | Step 1: lattice confined to the inside of the helmet (radius map); crash for large gaps fixed |
+| `071bda4` | Step 2: bottom opened, lid marker, lift-off direction; the helmet can be put on |
+| `ce132eb` | Step 3: stretch fit of the stock helmet; shell from the stock wall plus a thin skin |
+| `f08e59d` | Step 4a: fine surface grid, sampled only near the surfaces |
+| `3bea3c9` | Step 4b: re-entrant honeycomb walls; simplification with guaranteed error |
+| `7af4f73` | Steps 4c–4e: print file (crown-down), test coupons, fragment clean-up, new defaults |
+
+---
+
+## Credits
+
+- **Aarav Jayalwal** — the original generator: fit, signed-distance grid, lattice cells,
+  marching tetrahedra, viewer.
+- **Vihaan Thaker** — head-scan pipeline and the changes from step 1 on; developed with AI
+  assistance (Claude Code).
+- **Devansh** — the scan subject.
+- Stock helmet and sample head from GrabCAD.
